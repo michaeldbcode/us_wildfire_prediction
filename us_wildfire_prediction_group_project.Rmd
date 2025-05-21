@@ -1,0 +1,3640 @@
+---
+title: "st309 group project"
+output: html_document
+date: "2025-01-27"
+---
+### Data Setup - Description - Cleaning 
+
+**LIBRARY SETUP**
+```{r}
+library(RSQLite)
+library(tidyverse)
+library(caret)
+library(rpart)
+library(rpart.plot)
+library(pROC)
+library(dplyr)
+library(tigris)
+library(sf)
+library(pROC)
+library(randomForest)
+library(lubridate)
+library(zoo)
+library(purrr)
+library(maps)
+library(tidyr)
+library(ggplot2)
+library(leaflet) # for interactive plots but can't acc use in our PDF of course
+library(RColorBrewer)
+library(randomForest)
+library(stringr)
+library(xgboost)
+#daymet 
+library(ncdf4)
+
+```
+
+**DATA DOWNLOAD**
+```{r}
+# what we originally did below
+
+# con <- dbConnect(RSQLite::SQLite(),"~/Library/CloudStorage/OneDrive-LondonSchoolofEconomics/ST309/FPA_FOD_20170508.sqlite")
+# 
+# 
+# fires_data <- dbGetQuery(con, "SELECT * FROM Fires")
+# duplicate_data <- fires_data # just for safe keeping, not using
+#   
+# dbDisconnect(con)
+
+# for ease and efficiency, combine 6 csv's (to abide by Moodle's 100MB limit)
+ 
+# fires <- read.csv("Fires.csv")
+
+# total_rows <- nrow(fires)
+# 
+# # Base chunk size (1/6 of total)
+# base_chunk <- floor(total_rows/6)
+
+# multipliers <- c(
+#     1.12,    # First file
+#     0.99,    # Second file
+#     1.03,    # Third file 
+#     0.98,    # Fourth file
+#     0.97,    # Fifth file
+#     1.0      # Last file gets remainder
+# )
+# 
+# current_row <- 1
+# 
+# for(i in 1:6) {
+#     start_row <- current_row
+#     
+#     if(i < 6) {
+#         rows_this_chunk <- floor(base_chunk * multipliers[i])
+#         end_row <- start_row + rows_this_chunk - 1
+#     } else {
+#         end_row <- total_rows  # Last chunk gets remaining rows
+#     }
+#     
+#     chunk <- fires[start_row:end_row, ]
+#     write.csv(chunk, 
+#               file = paste0("fires_sixpart_", i, ".csv"),
+#               row.names = FALSE)
+#     
+#     current_row <- end_row + 1
+#     
+
+#     size_mb <- round(file.size(paste0("fires_sixpart_", i, ".csv")) / (1024 * 1024), 1)
+#     print(paste("File fires_sixpart_", i, ".csv size:", size_mb, "MB"))
+# }
+
+file_list <- paste0("fires_sixpart_", 1:6, ".csv")
+# Recombine files
+fires_data <- do.call(rbind, lapply(file_list, read.csv))
+```
+
+**DATA CLEANING AND MISSING VALUE CHECKING**
+```{r}
+# converting dates from Julian date format to Gregorian format
+fires_data$DISCOVERY_DATE_converted <- as.Date(fires_data$DISCOVERY_DOY - 1, origin=paste(fires_data$FIRE_YEAR, 1, 1, sep="-"))
+fires_data$CONT_DATE_converted <- as.Date(fires_data$CONT_DOY - 1, origin=paste(fires_data$FIRE_YEAR, 1, 1, sep="-"))
+fires_data$DISCOVERY_MONTH <- format(fires_data$DISCOVERY_DATE_converted, "%B")
+fires_data$CONT_MONTH <- format(fires_data$CONT_DATE_converted, "%B")
+# CConvert times to numeric, just in case
+fires_data$DISCOVERY_TIME <- as.numeric(as.character(fires_data$DISCOVERY_TIME))
+fires_data$CONT_TIME <- as.numeric(as.character(fires_data$CONT_TIME))
+
+
+
+
+# checking leap year handling
+print(fires_data[fires_data$FIRE_YEAR == 2012 & 
+                 fires_data$DISCOVERY_DOY >= 59 & 
+                 fires_data$DISCOVERY_DOY <= 61, 
+                 c("FIRE_YEAR", "DISCOVERY_DOY", "DISCOVERY_DATE_converted")])
+
+
+# missing value checking below:
+columns_to_check <- c(
+  "NWCG_REPORTING_UNIT_NAME", "SOURCE_REPORTING_UNIT_NAME", "DISCOVERY_DATE",
+  "DISCOVERY_DOY", "DISCOVERY_TIME", "STAT_CAUSE_CODE", "STAT_CAUSE_DESCR",
+  "CONT_DATE", "CONT_DOY", "CONT_TIME", "FIRE_SIZE", "LATITUDE", "LONGITUDE",
+  "OWNER_CODE", "OWNER_DESCR", "STATE", "Shape"
+)
+
+# get which columns actually exist in the dataframe
+existing_cols <- columns_to_check[columns_to_check %in% names(fires_data)]
+# count NAs in each column
+na_counts <- colSums(is.na(fires_data[existing_cols]))
+# count rows with any NA
+rows_with_na <- sum(rowSums(is.na(fires_data[existing_cols])) > 0)
+
+print(paste("Total rows with any NA:", rows_with_na))
+print("NA counts by column:")
+print(na_counts)
+
+
+# ordering the dataframe chronologically for nice train-test split, time wise
+fires_data <- fires_data %>%
+  arrange(DISCOVERY_DATE_converted)
+
+
+```
+
+
+**SPLITTING DATA INTO CALIFORNIA DATA AND CLEANING THE COUNTY NAMES BY FIXING MISSING VALUES USING LATITUDES AND LONGITUDES - now using THE_COUNTY**
+```{r}
+california_data <- subset(fires_data, STATE == "CA")
+
+unique(subset(fires_data, STATE == "CA")$FIPS_NAME)
+unique(subset(california_data)$THE_COUNTY)
+
+sum(is.na(california_data$THE_COUNTY))
+
+# using FIPS_NAME as all more standardised format, and will just replace anyway with coordinates determined County Names
+
+# CONVERTING COORDINATES INTO THE_COUNTY - provided both, but reading again from csv as is quicker and works easier
+
+# # get California counties shapefile and transform to WGS84
+# ca_counties <- counties(state = "CA", cb = TRUE) %>%
+#   st_transform(4326) %>%  # Transform to WGS84
+#   mutate(THE_COUNTY = toupper(NAME))
+
+# above few lines of code sped up by reading geojson below 
+
+ca_counties <- st_read("california_counties.geojson") %>%
+  st_transform(4326) %>%  # Transform to WGS84
+  mutate(THE_COUNTY = toupper(NAME))
+
+# convert california_data to an sf object
+ca_fires_sf <- st_as_sf(california_data, 
+                        coords = c("LONGITUDE", "LATITUDE"),
+                        crs = 4326)  # WGS84
+
+#  spatial join
+california_data$THE_COUNTY <- st_join(ca_fires_sf, 
+                                    ca_counties %>% select(THE_COUNTY))$THE_COUNTY
+
+# some NA's still but only 0.16% of our entire california dataset, maybe due to incorrect coords, being put in water, on boundaries, etc.
+sum(!is.na(california_data$THE_COUNTY))
+sum(is.na(california_data$THE_COUNTY))
+
+
+california_data <- california_data[!is.na(california_data$THE_COUNTY), ]
+
+# column selection, removing unnecessary things 
+california_data <- california_data %>% select(THE_COUNTY, NWCG_REPORTING_UNIT_NAME, FIRE_YEAR, DISCOVERY_DOY, DISCOVERY_TIME, STAT_CAUSE_DESCR, CONT_DOY, CONT_TIME, FIRE_SIZE, FIRE_SIZE_CLASS, LATITUDE, LONGITUDE, OWNER_CODE, OWNER_DESCR, Shape, DISCOVERY_DATE_converted, CONT_DATE_converted, DISCOVERY_MONTH, CONT_MONTH)
+
+```
+
+### Exploratory Data Analysis
+
+#Calculating the count, total acres burned, and average fire size for each state, and plotting it.
+```{r}
+state_summary <- fires_data %>%
+  group_by(STATE) %>%
+  summarise(
+    COUNT = n(),
+    TOTAL_ACRES = sum(FIRE_SIZE, na.rm = TRUE),
+    AVERAGE_FIRE_SIZE = TOTAL_ACRES / COUNT  
+  ) %>%
+  arrange(desc(COUNT))
+```
+
+# Printing the two US graphs
+```{r}
+us_states <- map_data("state")
+state_summary$STATE <- tolower(state.name[match(state_summary$STATE, state.abb)])
+us_states_fires <- left_join(us_states, state_summary, by = c("region" = "STATE"))
+
+plot_fire_map <- function(data, fill_var, title, fill_label) {
+  ggplot(data) +
+    geom_polygon(aes(x = long, y = lat, group = group, fill = !!sym(fill_var)), 
+                 color = "black", size = 0.3) +
+    scale_fill_gradient(low = "lightpink", high = "darkred", 
+                        name = fill_label, na.value = "grey50",
+                        labels = scales::comma) +  
+    theme_minimal() +
+    ggtitle(title) +
+    theme(
+      axis.text = element_blank(),
+      axis.ticks = element_blank(),
+      axis.title = element_blank(),
+      panel.grid = element_blank(),
+      plot.title = element_text(hjust = 0.5)
+    )
+}
+
+map1 <- plot_fire_map(us_states_fires, "COUNT", "Number of Fires by State", "Number of Fires")
+print(map1)
+```
+```{r}
+map2 <- plot_fire_map(us_states_fires, "TOTAL_ACRES", "Total Acres Burned by State", "Total Acres Burned")
+print(map2)
+```
+# CREATING FUNCTION TO CREATE DATAFRAME
+```{r}
+create_fire_summary <- function(df, group_var) {
+  df %>%
+    group_by(!!sym(group_var)) %>%
+    summarise(
+      COUNT = n(),
+      TOTAL_ACRES = sum(FIRE_SIZE, na.rm = TRUE),
+      AVERAGE_FIRE_SIZE = TOTAL_ACRES / COUNT
+    ) %>%
+    arrange(desc(COUNT))
+}
+```
+
+# Total acres per year
+```{r}
+california_time_data <- create_fire_summary(california_data, "FIRE_YEAR")
+
+california_time_data <- california_time_data %>%
+  arrange(FIRE_YEAR)
+
+ca_count_graph <- ggplot(california_time_data, aes(x = factor(FIRE_YEAR), y = TOTAL_ACRES)) +
+  geom_bar(stat = "identity", fill = "darkorange", alpha = 0.8) +
+  geom_smooth(aes(group=1), method = "lm", se = FALSE, color = "red", linetype = "dashed", size=1.2) +  
+  scale_y_continuous(labels = scales::comma) +
+  labs(title = "Figure 2: Total Acres Burned in California by Year", x = "Year", y = "Total Acres Burned") +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    plot.title = element_text(hjust = 0.5), 
+    panel.grid.major = element_blank(), 
+    panel.grid.minor = element_blank()
+  )
+
+print(ca_count_graph)
+```
+# Total acres per month
+```{r}
+california_month_data <- create_fire_summary(california_data, "DISCOVERY_MONTH")
+month_order <- c("January", "February", "March", "April", "May", "June", "July", 
+                 "August", "September", "October", "November", "December")
+
+california_month_data_sorted <- california_month_data %>%
+  mutate(DISCOVERY_MONTH = factor(DISCOVERY_MONTH, levels = month_order)) %>%
+  arrange(DISCOVERY_MONTH)
+
+count_graph_disc_month <- ggplot(california_month_data_sorted, aes(x = DISCOVERY_MONTH, y = TOTAL_ACRES)) +
+  geom_bar(stat = "identity", fill = "red", alpha = 0.8) +
+  scale_y_continuous(labels = scales::comma) +  
+  labs(title = "Figure 3: Total Acres Burned in California per Discovery Month", x = "Month", y = "Total acres burned") +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid.major = element_blank(), 
+    panel.grid.minor = element_blank()   
+  )
+
+print(count_graph_disc_month)
+
+```
+# Fire incidents by cause
+```{r}
+fires_by_stat_cause <- create_fire_summary(california_data, "STAT_CAUSE_DESCR")
+
+scale_factor <- max(fires_by_stat_cause$COUNT, na.rm = TRUE) / max(fires_by_stat_cause$AVERAGE_FIRE_SIZE, na.rm = TRUE)
+
+stat_cause_graph <- ggplot(fires_by_stat_cause, aes(x = reorder(STAT_CAUSE_DESCR, -COUNT))) +
+  geom_bar(aes(y = COUNT, fill = STAT_CAUSE_DESCR), stat = "identity", alpha = 0.8) +
+  geom_text(aes(y = COUNT, label = scales::comma(COUNT)), vjust = -0.5, size = 2.5) + 
+  geom_line(aes(y = AVERAGE_FIRE_SIZE * scale_factor, group = 1), color = "red", size = 0.8) +  
+  geom_point(aes(y = AVERAGE_FIRE_SIZE * scale_factor), color = "red", size = 1.5) +
+  geom_text(aes(y = AVERAGE_FIRE_SIZE * scale_factor, label = round(AVERAGE_FIRE_SIZE, 2)), 
+            vjust = -0.5, color = "red", size = 2.5) +
+  scale_y_continuous(
+    labels = scales::comma, 
+    sec.axis = sec_axis(~ . / scale_factor, name = "Average Fire Size (Acres)")
+  ) +
+  labs(title = "Figure 4: Fire Incidents in California by Cause", x = "Cause of Fire", y = "Number of Fires") +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    plot.title = element_text(hjust = 0.5),
+    legend.position = "none",
+    panel.grid.major = element_blank(), 
+    panel.grid.minor = element_blank()  
+  )
+
+print(stat_cause_graph)
+```
+#Fire incidents by size class
+```{r}
+fires_by_size_class <- create_fire_summary(california_data, "FIRE_SIZE_CLASS")
+
+size_class_order <- c("A", "B", "C", "D", "E", "F", "G")
+
+fires_by_size_class_sorted <- fires_by_size_class %>%
+  mutate(FIRE_SIZE_CLASS = factor(FIRE_SIZE_CLASS, levels = size_class_order)) %>%
+  arrange(FIRE_SIZE_CLASS)
+
+size_class_graph <- ggplot(fires_by_size_class_sorted, aes(x = FIRE_SIZE_CLASS, y = COUNT)) +
+  geom_bar(stat = "identity", fill = "lightgreen", alpha = 0.8) +
+  geom_text(aes(label = scales::comma(COUNT)), vjust = -0.5, size = 3) + 
+  scale_y_continuous(labels = scales::comma) +  
+  labs(title = "Figure 5: Number of Fires in California by Fire Size Class", x = "Fire Size Class", y = "Number of Fires") +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    panel.grid.major = element_blank(),  
+    panel.grid.minor = element_blank() 
+  )
+
+print(size_class_graph)
+```
+#Fire incidents by ownership
+```{r}
+fires_by_ownership <- create_fire_summary(california_data, "OWNER_DESCR")
+View(fires_by_ownership)
+
+## NOT INSIGHTFUL ON INSPECTION 
+## since more than 100000 observations have OWNER_DESCR "MISSING/NOT SPECIFIED"
+```
+
+
+
+### Predicting wildfires with Machine Learning
+
+ML SECTION:
+
+Target variable is "the total acres burned in a particular county in a specific month"
+  Total acres burned = sum of FIRE_SIZE for fires that happened in that county in that month
+
+Performance metrics:
+- Compare accuracy, specificity, etc.
+- ROC curves and AUC values on plot (converting into auc vals.)
+
+Visual representation:
+- AUC/ROC curves of performance of diff models
+- Time series plots showing predicted vs actual for selected 3 counties (high: Los Angeles, Medium: ?, Low: ?)
+- Choropleth map of california showing prediction accuracy by county
+
+
+**Grouping by county, month, and adding target variable (total acres burned) for ML section** 
+
+```{r}
+# adding in null empty rows for days with no fire for each county, so then can keep all features, and then we average to find monthly
+
+daily_county_data <- expand.grid(
+ THE_COUNTY = unique(california_data$THE_COUNTY),
+ DATE = seq.Date(
+   from = min(california_data$DISCOVERY_DATE_converted),
+   to = max(california_data$DISCOVERY_DATE_converted),
+   by = "day"
+ ),
+ stringsAsFactors = FALSE
+) %>%
+ as_tibble() %>%
+ mutate(
+   YEAR = year(DATE),
+   MONTH = month(DATE)
+ )
+
+# join with original fire data
+daily_county_data <- daily_county_data %>%
+ left_join(
+   california_data %>%
+     select(THE_COUNTY, DISCOVERY_DATE_converted, FIRE_SIZE, 
+            STAT_CAUSE_DESCR, OWNER_CODE, OWNER_DESCR, 
+            LATITUDE, LONGITUDE, NWCG_REPORTING_UNIT_NAME),
+   by = c("THE_COUNTY" = "THE_COUNTY",
+          "DATE" = "DISCOVERY_DATE_converted")
+ ) %>%
+ mutate(FIRE_SIZE = replace_na(FIRE_SIZE, 0))
+
+# 3. making th monthly target (total acres burned per county / month)
+monthly_totals <- daily_county_data %>%
+ group_by(THE_COUNTY, YEAR, MONTH) %>%
+ summarise(
+   total_acres_burned = sum(FIRE_SIZE),
+   .groups = 'drop'
+ )
+
+```
+
+## Creating a frequency graph using monthly_totals as part of EDA
+
+```{r}
+monthly_totals <- monthly_totals %>%
+  mutate(log_acres_burned = log(total_acres_burned + 1)) 
+
+# defining bin breaks from 0 to 13 with 0.5 intervals
+bin_breaks <- seq(0, 13, by = 0.5)
+
+median_value <- median(monthly_totals$log_acres_burned)
+
+histogram_plot <- ggplot(monthly_totals, aes(x = log_acres_burned)) +
+  geom_histogram(breaks = seq(0, 13, by = 0.5), fill = "steelblue", color = "black", alpha = 0.8) +
+  geom_vline(xintercept = median_value, color = "red", linetype = "dashed", size = 1) +
+  annotate("text", x = median_value + 0.3,
+           y = max(table(cut(monthly_totals$log_acres_burned, breaks = seq(0, 13, by = 0.5)))) * 2,
+           label = "Median = 1.224", color = "red", size = 5, fontface = "bold", hjust = 0) +
+  scale_x_continuous(breaks = seq(0, 13, by = 0.5)) +  
+  labs(title = "Figure 6: Histogram of Log-Transformed Total Acres Burned",
+       x = "Log of Total Acres Burned",
+       y = "Count") +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(size = 7),
+    panel.grid.major = element_blank(),  
+    panel.grid.minor = element_blank(),  
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold")
+  )
+
+print(histogram_plot)
+```
+
+
+To help understand what the owner_code and owner_descr actually are as no available documentation online:
+```{r}
+# nique combinations of OWNER_CODE and OWNER_DESCR to
+unique_ownerpairs <- california_data %>%
+  select(OWNER_CODE, OWNER_DESCR) %>%
+  distinct()
+
+print(unique_ownerpairs)
+```
+Likely stands for:
+
+BIA: Bureau of Indian Affairs
+USFS: U.S. Forest Service
+FWS: U.S. Fish and Wildlife Service
+BLM: Bureau of Land Management
+NPS: National Park Service
+BOR: Bureau of Reclamation
+Other Descriptions:
+STATE OR PRIVATE: Land owned by a state or private individual/corporation.
+PRIVATE: Specifically private land.
+OTHER FEDERAL: Federal land not managed by the primary federal agencies
+STATE: Land owned or managed by a state government.
+TRIBAL: Land under Native American tribal jurisdiction.
+FOREIGN: Land owned by foreign entities.
+COUNTY: Land owned or managed by county governments.
+MUNICIPAL/LOCAL: Land managed by municipal or local governments.
+MISSING/NOT SPECIFIED: Ownership information is not available or was not recorded.
+UNDEFINED FEDERAL: Land owned by the federal government but not attributed to a specific agency.
+
+
+
+
+
+*DAYMET WEATHER *
+In this code block below, the commented out code is the original extraction of the DayMet data from NASA on the Monthly Climate Summaries on a 1-km Grid for North America, Version 4 R1
+(https://daac.ornl.gov/cgi-bin/dsviewer.pl?ds_id=2131) - can be downloaded from here, 4GB file.
+
+This code block is all commented out as takes a long time to run, and this helps with computational efficiency. And given moodle constraints of 100MB max and 10 files maximum, we are unable to also provide the read.csv of this as the csv alone is 1.2GB and splitting this takes us over the maximum allowed file number of 10 Therefore, we skip this stage and provide only the clean california data for monthly observations (agg_monthly_daymet_data.csv), since this is what we use in our analysis.
+
+This agg_monthly_daymet_data.csv has the total precipation (every day in the month, summed), average tmax (maximum temperature), and average tmin (minimum temperature) across the months.
+
+Below we also converted the daymet daily data into an sf object so we could use the coordinates to then label the data by interpretable THE_COUNTY names as opposed to just coordinates. A slight buffer was used to prevent issues with weather stations being on borders or very close, etc. 
+
+```{r}
+# extract_daymet_data <- function(nc_path, variable, start_year, end_year) {
+#   nc <- nc_open(nc_path)
+# 
+#   # extractin  variables
+#   station_ids <- ncvar_get(nc, "station_id")
+#   latitudes <- ncvar_get(nc, "stn_lat")
+#   longitudes <- ncvar_get(nc, "stn_lon")
+#   time <- ncvar_get(nc, "time")  # Days since 1950-01-01
+#   values <- ncvar_get(nc, "pred")  # Weather variable values
+# 
+# 
+#   nc_close(nc)
+# 
+#   # convrt time to actual dates
+#   base_date <- as.Date("1950-01-01")
+#   dates <- base_date + time
+# 
+#   # making data frame
+#   weather_data <- data.frame(
+#     station_id = rep(station_ids, each = length(dates)),
+#     latitude = rep(latitudes, each = length(dates)),
+#     longitude = rep(longitudes, each = length(dates)),
+#     date = rep(dates, times = length(station_ids)),
+#     value = as.vector(values)
+#   )
+# 
+#   # filtering for only cali
+#   california_weather <- weather_data %>%
+#     filter(
+#       latitude >= 32.0, latitude <= 42.0,   # California Lat Range
+#       longitude >= -125.0, longitude <= -114.0, # California Lon Range
+#       year(date) >= start_year & year(date) <= end_year
+#     )
+# 
+#   return(california_weather)
+# }
+# 
+# 
+# base_path <- ""
+# 
+# 
+# variables <- c("prcp", "tmax", "tmin")
+# 
+# 
+# years <- 1992:2015
+# 
+# # iterating over variables and years
+# daymet_data <- purrr::map_df(variables, function(var) {
+#   purrr::map_df(years, function(yr) {
+#     file_path <- file.path(base_path, sprintf("daymet_v4_stnxval_%s_na_%d.nc", var, yr))
+# 
+#     if (file.exists(file_path)) {
+#       extract_daymet_data(file_path, var, min(years), max(years)) %>%
+#         mutate(variable = var)  # Add variable column
+#     } else {
+#       message("File not found: ", file_path)
+#       return(NULL)
+#     }
+#   })
+# })
+
+# # converting to sf object here
+# daymet_sf <- st_as_sf(daymet_data, 
+#                       coords = c("longitude", "latitude"),
+#                       crs = 4326)
+# 
+# # create buffered 
+# ca_counties_buffered <- ca_counties %>%
+#   st_buffer(0.0005) 
+# 
+# # st_nearest_feature  assigns each pt. to the nearest county 
+# nearest_county_index <- st_nearest_feature(daymet_sf, ca_counties_buffered)
+# daymet_data$THE_COUNTY <- ca_counties_buffered$THE_COUNTY[nearest_county_index]
+# 
+# # checking ...
+# print("Number of rows in daymet_data:")
+# print(nrow(daymet_data))
+# print("Number of NA counties:")
+# print(sum(is.na(daymet_data$THE_COUNTY)))
+# 
+# stations_per_county <- daymet_data %>%
+#   group_by(THE_COUNTY) %>%
+#   summarize(
+#     unique_stations = n_distinct(station_id),
+#     total_observations = n()
+#   ) %>%
+#   arrange(desc(unique_stations))
+# 
+# print(stations_per_county)
+# 
+# avg_stations <- mean(stations_per_county$unique_stations)
+# print(paste("Average number of stations per county:", round(avg_stations, 2)))
+
+
+```
+
+```{r}
+
+# # created aggregated data frame with dailly averages per county
+# agg_daymet_data <- daymet_data %>%
+#   group_by(THE_COUNTY, date, variable) %>%
+#   summarize(
+#     daily_value = mean(value, na.rm = TRUE)
+#   ) %>%
+#   ungroup() %>%
+#   # pivot func to get separate columns for each variable (prcp, tmax, tmin)
+#   pivot_wider(
+#     names_from = variable,
+#     values_from = daily_value
+#   )
+# 
+# #check
+# print("Dimensions of original daymet_data:")
+# print(dim(daymet_data))
+# print("Dimensions of aggregated daymet_data:")
+# print(dim(agg_daymet_data))
+# print("Sample of aggregated data:")
+# print(head(agg_daymet_data))
+# 
+# # aggregated further to monthly as that is what we acc need for our analysis and ML models
+# agg_monthly_daymet_data <- agg_daymet_data %>%
+#   mutate(
+#     year = year(date),
+#     month = month(date)
+#   ) %>%
+#   group_by(THE_COUNTY, year, month) %>%
+#   summarize(
+#     total_prcp = sum(prcp, na.rm = TRUE), 
+#     tmax = mean(tmax, na.rm = TRUE),      
+#     tmin = mean(tmin, na.rm = TRUE)     
+#   ) %>%
+#   ungroup()
+
+# # checking ...
+# print("Dimensions of daily aggregated data:")
+# print(dim(agg_daymet_data))
+# print("Dimensions of monthly aggregated data:")
+# print(dim(agg_monthly_daymet_data))
+# print("Sample of monthly aggregated data:")
+# print(head(agg_monthly_daymet_data))
+# 
+# # checking NA cases .........
+# na_cases <- daymet_data[is.na(daymet_data$THE_COUNTY), ] %>%
+#   select(latitude, longitude) %>%
+#   distinct()
+# 
+# print(head(na_cases))
+# 
+# # trying the small bufffer again
+# daymet_sf <- st_as_sf(daymet_data, 
+#                       coords = c("longitude", "latitude"),
+#                       crs = 4326)
+# 
+# ca_counties_buffered <- ca_counties %>%
+#   st_buffer(0.01)  #  1km 
+# 
+# # redo  spatial join with buffered counties
+# daymet_data$THE_COUNTY <- st_join(daymet_sf, 
+#                                  ca_counties_buffered %>% select(THE_COUNTY))$THE_COUNTY
+# 
+# print(sum(is.na(daymet_data$THE_COUNTY))) 
+# # been more conservative here, since the ones on the edge are on mexican border, and we are focused on averages anyway, not stations
+```
+
+
+**Reading in agg_monthly weather dataset**
+```{r}
+
+agg_monthly_daymet_data <- read.csv("agg_monthly_daymet_data.csv")
+# standardise column names in agg_monthly_daymet_data to merge
+agg_monthly_daymet_data <- agg_monthly_daymet_data %>%
+  rename(
+    YEAR = year,
+    MONTH = month
+  )
+```
+
+
+
+Merging our monthly_totals dataframe which has california's counties and monthly total_acres_burned across 1992-2015, with the corresponding precipitation, temp max, and temp min from my agg_monthly_daymet_data
+```{r}
+# merging the dataframes
+merged_county_fires_weather <- agg_monthly_daymet_data %>%
+  left_join(monthly_totals, 
+            by = c("THE_COUNTY", "YEAR", "MONTH"))
+
+print("Dimensions of weather data:")
+print(dim(agg_monthly_daymet_data))
+print("Dimensions of fire data:")
+print(dim(monthly_totals))
+print("Dimensions of merged data:")
+print(dim(merged_county_fires_weather))
+
+# NAS
+print("Number of NAs in total_acres_burned:")
+print(sum(is.na(merged_county_fires_weather$total_acres_burned)))
+
+```
+
+
+Making Chloerpleth maps for Daymet weather Data (EDA)
+
+
+```{r}
+# taking avg.'s 
+county_weather <- merged_county_fires_weather %>%
+  group_by(THE_COUNTY) %>%
+  summarise(
+    avg_prcp = mean(total_prcp, na.rm = TRUE),
+    avg_tmax = mean(tmax, na.rm = TRUE),
+    avg_tmin = mean(tmin, na.rm = TRUE)
+  )
+
+#  originally was just reading 
+ california_counties <- st_read("california_counties.geojson") %>%
+   st_transform(4326) %>%  # Transform to WGS84
+   mutate(NAME = toupper(NAME))  
+
+# merging the files
+county_map_data <- left_join(california_counties, county_weather, by = c("NAME" = "THE_COUNTY"))
+
+# map for precipitation   
+p_rain <- ggplot(county_map_data) +
+  geom_sf(aes(fill = avg_prcp), color = "white") +
+  scale_fill_gradient(low = "lightblue", high = "blue", name = "Avg Precip (mm)") +
+  labs(title = "Average Precipitation by County in California") +
+  theme_minimal() +
+  theme(axis.text = element_blank(),
+        axis.ticks = element_blank())
+
+# map for max temp  
+p_tmax <- ggplot(county_map_data) +
+  geom_sf(aes(fill = avg_tmax), color = "white") +
+  scale_fill_gradient(low = "mistyrose", high = "red", name = "Avg Tmax (°C)") +
+  labs(title = "Average Maximum Temperature by County in California") +
+  theme_minimal() +
+  theme(axis.text = element_blank(),
+        axis.ticks = element_blank())
+
+# map for min temp
+p_tmin <- ggplot(county_map_data) +
+  geom_sf(aes(fill = avg_tmin), color = "white") +
+  scale_fill_gradient(low = "mistyrose", high = "red", name = "Avg Tmin (°C)") +
+  labs(title = "Average Minimum Temperature by County in California") +
+  theme_minimal() +
+  theme(axis.text = element_blank(),
+        axis.ticks = element_blank())
+
+if (!dir.exists("wording")) {
+  dir.create("wording")
+}
+
+ggsave(filename = "wording/avg_precipitation.png", plot = p_rain, width = 8, height = 6, dpi = 300)
+ggsave(filename = "wording/avg_max_temperature.png", plot = p_tmax, width = 8, height = 6, dpi = 300)
+ggsave(filename = "wording/avg_min_temperature.png", plot = p_tmin, width = 8, height = 6, dpi = 300)
+
+print(p_rain)
+print(p_tmax)
+print(p_tmin)
+
+```
+
+**Analysing Yosemite National Park**
+
+```{r}
+# # read and conv boundary
+# yosemite_boundary <- st_read("yose_boundary.shp") %>%
+#   st_transform(4326)  # Transform to WGS84
+# 
+# # read and conv tracts.
+# yosemite_tracts <- st_read("yose_tracts.shp") %>%
+#   st_transform(4326)  # Transform to WGS84
+# 
+# # Save as GeoJSON files
+# st_write(yosemite_boundary, "yosemite_boundary.geojson", 
+#          delete_dsn = TRUE)  # delete_dsn=TRUE overwrites existing file
+# 
+# st_write(yosemite_tracts, "yosemite_tracts.geojson", 
+#          delete_dsn = TRUE)
+# 
+# # cehcking  the new GeoJSON files
+# test_boundary <- st_read("yosemite_boundary.geojson")
+# print("Successfully created and read yosemite_boundary.geojson")
+# 
+# 
+# yosemite_boundary <- st_read("yosemite_boundary.geojson")
+# yosemite_tracts <- st_read("yosemite_tracts.geojson")
+# 
+# # adding type column to each dataset to distinguish features
+# yosemite_boundary$feature_type <- "boundary"
+# yosemite_tracts$feature_type <- "tract"
+# 
+# # Ensure both datasets have  same columns
+# # Get all column names from both datasets
+# all_cols <- unique(c(names(yosemite_boundary), names(yosemite_tracts)))
+# 
+# # missing columns to each dataset withthe NA values
+# for(col in all_cols) {
+#   if(!col %in% names(yosemite_boundary)) yosemite_boundary[[col]] <- NA
+#   if(!col %in% names(yosemite_tracts)) yosemite_tracts[[col]] <- NA
+# }
+# 
+# # comb.  datasets
+# yosemite_combined <- rbind(yosemite_boundary, yosemite_tracts)
+# 
+# # saving as GEOjson
+# st_write(yosemite_combined, "yosemite_complete.geojson", delete_dsn = TRUE)
+
+```
+
+```{r}
+## DUE TO MOODLE FILE LIMIT CONSTRAINTS, CANNOT PROVIDE yosemite_complete.geojson as this brings us to 11 and we cannot reduce any further, hence this code is commented out and more of a showcase of what we did do ##
+
+# 
+# yosemite <- st_read("yosemite_complete.geojson") %>%
+#   st_transform(4326)
+# bbox <- st_bbox(yosemite)
+# 
+# # filtering fires by bounding box and extract coordinates
+# yosemite_fires <- california_data %>%
+#   filter(
+#     LONGITUDE >= bbox["xmin"],
+#     LONGITUDE <= bbox["xmax"],
+#     LATITUDE >= bbox["ymin"],
+#     LATITUDE <= bbox["ymax"]
+#   )
+# 
+# # density heatmap
+# plotting_yosemite <- ggplot() +
+#   theme(panel.background = element_rect(fill = "white", color = NA)) +
+#   
+#   stat_density2d_filled(
+#     data = yosemite_fires,
+#     aes(x = LONGITUDE, y = LATITUDE, fill = after_stat(level)),
+#     alpha = 0.7,
+#     bins = 9,
+#     contour_var = "ndensity"
+#   ) +
+#   
+#   geom_sf(data = filter(yosemite, feature_type == "boundary"),
+#           fill = NA, color = "black", linewidth = 0.75) +
+#   
+#   geom_sf(data = filter(yosemite, feature_type == "tract"),
+#           fill = NA, color = "black", linewidth = 0.75, alpha = 0.5) +
+#   
+#   scale_fill_viridis_d(
+#     option = "turbo",
+#     direction = 1,
+#     name = "Fire Density",
+#     labels = c("Very Low", "Low", "Medium-Low", "Medium", "Medium-High", 
+#                "High", "Very High", "Extreme", "Peak"),
+#     guide = guide_legend(
+#       title.position = "top",
+#       title.hjust = 0.5,
+#       ncol = 1,
+#       keywidth = unit(1.5, "cm"),
+#       keyheight = unit(0.5, "cm")
+#     )
+#   ) +
+#   
+#   coord_sf(
+#     xlim = c(bbox["xmin"], bbox["xmax"]),
+#     ylim = c(bbox["ymin"], bbox["ymax"]),
+#     clip = "on"
+#   ) +
+#   
+#   theme_minimal() +
+#   labs(
+#     title = "Wildfire Density in Yosemite National Park (1992-2015)",
+#     subtitle = "Areas of higher fire occurrence shown in warmer colors"
+#   ) +
+#   theme(
+#     plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
+#     plot.subtitle = element_text(hjust = 0.5, size = 12),
+#     plot.caption = element_text(hjust = 1, size = 8, color = "gray50"),
+#     legend.position = "right",
+#     panel.grid = element_blank(),
+#     axis.text = element_text(size = 8),
+#     panel.background = element_rect(fill = "white", color = NA),
+#     legend.background = element_rect(fill = "white", color = "black", linewidth = 0.3),
+#     legend.text = element_text(size = 8),
+#     legend.title = element_text(size = 10, face = "bold")
+#   )
+# 
+# 
+# summary_stats <- yosemite_fires %>%
+#   summarize(
+#     total_fires = n(),
+#     total_acres = sum(FIRE_SIZE, na.rm = TRUE),
+#     avg_fire_size = mean(FIRE_SIZE, na.rm = TRUE),
+#     max_fire_size = max(FIRE_SIZE, na.rm = TRUE)
+#   )
+# 
+# print("Summary Statistics:")
+# print(summary_stats)
+```
+
+## Prediction part of paper
+
+**DECISION TREES** 
+**attempted a regression first - did not work - likely due to the skew in the data, hence chose to continue with classification for better interpretation of results**
+
+```{r}
+# next month's total burned acres as target and log transformed it
+merged_county_fires_weather <- merged_county_fires_weather %>%
+  group_by(THE_COUNTY) %>%
+  mutate(
+    next_month_acres = lead(total_acres_burned, n = 1),
+    next_month_acres_log = log1p(next_month_acres)  # log1p adds 1 before log to handle zeros
+  ) %>%
+  ungroup()
+
+# some feature engineering testing
+merged_county_fires_weather <- merged_county_fires_weather %>%
+  group_by(THE_COUNTY) %>%
+  mutate(
+    temp_range = tmax - tmin,
+    rolling_prcp = rollmean(total_prcp, k = 3, fill = NA, align = "right"),
+    rolling_tmax = rollmean(tmax, k = 3, fill = NA, align = "right"),
+    season = case_when(
+      MONTH %in% c(12,1,2) ~ "Winter",
+      MONTH %in% c(3,4,5) ~ "Spring",
+      MONTH %in% c(6,7,8) ~ "Summer",
+      MONTH %in% c(9,10,11) ~ "Fall"
+    )
+  ) %>%
+  ungroup()
+
+# removing last row for each county as it won't have a next_month value
+merged_county_fires_weather <- merged_county_fires_weather %>%
+  group_by(THE_COUNTY) %>%
+  dplyr::slice(1:(dplyr::n()-1)) %>%
+  ungroup()
+
+# 80-20 split for train-test
+split_year <- quantile(unique(merged_county_fires_weather$YEAR), 0.8)
+
+# making training and test datasets
+new_train_data <- merged_county_fires_weather %>% 
+  filter(YEAR <= split_year)
+
+new_test_data <- merged_county_fires_weather %>% 
+  filter(YEAR > split_year)
+
+# decision tree model
+tree_model <- rpart(
+  next_month_acres_log ~ total_prcp + tmax + tmin + THE_COUNTY + MONTH,
+  data = new_train_data,
+  method = "anova",
+  control = rpart.control(
+    minsplit = 3,     
+    cp = 0.005,
+    maxdepth = 15     
+  )
+)
+
+# plotting 
+rpart.plot(tree_model, 
+           box.palette = "blue",
+           shadow.col = "gray",
+           nn = TRUE)
+
+# predictions and calculating metrics
+predictions <- exp(predict(tree_model, new_test_data)) - 1
+rmse <- sqrt(mean((new_test_data$next_month_acres - predictions)^2, na.rm = TRUE))
+mae <- mean(abs(new_test_data$next_month_acres - predictions), na.rm = TRUE)
+
+print(paste("RMSE:", round(rmse, 2)))
+print(paste("MAE:", round(mae, 2)))
+
+# variable importance again with error handling
+if (length(tree_model$variable.importance) > 0) {
+  var_importance <- data.frame(
+    Variable = names(tree_model$variable.importance),
+    Importance = as.numeric(tree_model$variable.importance)
+  )
+  print("Variable Importance:")
+  print(var_importance[order(-var_importance$Importance), ])
+} else {
+  print("No var importance scores available") # - the tree may be too simple or the relationships too weak
+}
+```
+```{r}
+# checking the distribution of fires
+print("Summary of total_acres_burned:")
+summary(merged_county_fires_weather$total_acres_burned)
+print("Percentage of months with zero acres burned:")
+mean(merged_county_fires_weather$total_acres_burned == 0) * 100
+
+# adding inn lagged features
+merged_county_fires_weather <- merged_county_fires_weather %>%
+  group_by(THE_COUNTY) %>%
+  arrange(YEAR, MONTH) %>%
+  mutate(
+    # last mo.'s values
+    prev_month_burned = lag(total_acres_burned, 1),
+    prev_month_prcp = lag(total_prcp, 1),
+    prev_month_tmax = lag(tmax, 1),
+    prev_month_tmin = lag(tmin, 1),
+    
+    # 3-mo. rolling averages
+    roll_mean_prcp = (total_prcp + lag(total_prcp, 1) + lag(total_prcp, 2))/3,
+    roll_mean_tmax = (tmax + lag(tmax, 1) + lag(tmax, 2))/3,
+    
+    # seasonal indicators
+    is_fire_season = ifelse(MONTH %in% c(6,7,8,9), 1, 0),
+    
+    # interact terms
+    hot_and_dry = ifelse(tmax > median(tmax, na.rm=TRUE) & 
+                        total_prcp < median(total_prcp, na.rm=TRUE), 1, 0)
+  ) %>%
+  ungroup()
+
+# train-test split w time series nature
+# use earlier years for training, most recent years for testing
+split_year <- quantile(unique(merged_county_fires_weather$YEAR), 0.8)
+
+new_train_data <- merged_county_fires_weather %>% 
+  filter(YEAR <= split_year) %>%
+  na.omit()  
+
+new_test_data <- merged_county_fires_weather %>% 
+  filter(YEAR > split_year) %>%
+  na.omit()
+
+# 3.  improved model
+tree_model <- rpart(
+  next_month_acres_log ~ 
+    total_prcp + tmax + tmin + 
+    THE_COUNTY + MONTH + 
+    prev_month_burned + prev_month_prcp + 
+    prev_month_tmax + prev_month_tmin +
+    roll_mean_prcp + roll_mean_tmax +
+    is_fire_season + hot_and_dry,
+  data = new_train_data,
+  method = "anova",
+  control = rpart.control(
+    minsplit = 20,
+    minbucket = 10,
+    cp = 0.001,
+    maxdepth = 15
+  )
+)
+
+predictions <- exp(predict(tree_model, new_test_data)) - 1
+
+rmse <- sqrt(mean((new_test_data$next_month_acres - predictions)^2, na.rm = TRUE))
+mae <- mean(abs(new_test_data$next_month_acres - predictions), na.rm = TRUE)
+
+print(paste("RMSE:", round(rmse, 2)))
+print(paste("MAE:", round(mae, 2)))
+
+
+if (length(tree_model$variable.importance) > 0) {
+  var_importance <- data.frame(
+    Variable = names(tree_model$variable.importance),
+    Importance = as.numeric(tree_model$variable.importance)
+  )
+  print("Variable Importance:")
+  print(var_importance[order(-var_importance$Importance), ])
+}
+
+#  diagnostics
+print("Distribution of predictions:")
+summary(predictions)
+
+print("Distribution of actual values:")
+summary(new_test_data$next_month_acres)
+
+#  eval plot
+plot(new_test_data$next_month_acres, predictions,
+     xlab = "Actual Acres Burned",
+     ylab = "Predicted Acres Burned",
+     main = "Predicted vs Actual Acres Burned",
+     pch = 19,
+     col = rgb(0, 0, 1, 0.5))
+abline(a = 0, b = 1, col = "red", lwd = 2)
+```
+
+```{r}
+# feature engineering for log-transformed variables
+merged_county_fires_weather <- merged_county_fires_weather %>%
+  group_by(THE_COUNTY) %>%
+  arrange(YEAR, MONTH) %>%
+  mutate(
+    log_acres = log(total_acres_burned + 1),
+    log_next_month_acres = log(next_month_acres + 1),
+    
+    # rolling averages
+    roll_mean_prcp = (total_prcp + lag(total_prcp, 1) + lag(total_prcp, 2)) / 3,
+    roll_mean_tmax = (tmax + lag(tmax, 1) + lag(tmax, 2)) / 3,
+    
+    county_avg_fires = mean(log_acres, na.rm = TRUE),
+    monthly_historical_avg = ave(log_acres, MONTH, FUN = mean)
+  ) %>%
+  ungroup()
+
+# the 80-20 train-test split based on YEAR #
+split_year <- quantile(unique(merged_county_fires_weather$YEAR), 0.8)
+
+train_data <- merged_county_fires_weather %>% 
+  filter(YEAR <= split_year) %>%
+  na.omit()
+
+test_data <- merged_county_fires_weather %>% 
+  filter(YEAR > split_year) %>%
+  na.omit()
+
+# the regression tree model #
+# we use the logged next month acres as the target
+reg_tree_model <- rpart(
+  log_next_month_acres ~ total_prcp + tmax + tmin + 
+    roll_mean_prcp + roll_mean_tmax + county_avg_fires + monthly_historical_avg,
+  data = train_data,
+  method = "anova",
+  control = rpart.control(
+    minsplit = 20,
+    cp = 0.001,
+    maxdepth = 15
+  )
+)
+
+rpart.plot(reg_tree_model, 
+           box.palette = "blue",
+           shadow.col = "gray",
+           nn = TRUE)
+
+#  logged scale
+predictions_log <- predict(reg_tree_model, test_data)
+
+# converting predictions back to original scale
+predictions <- exp(predictions_log) - 1
+
+# evaluating performance
+rmse <- sqrt(mean((test_data$next_month_acres - predictions)^2, na.rm = TRUE))
+mae <- mean(abs(test_data$next_month_acres - predictions), na.rm = TRUE)
+
+print(paste("Regression Model RMSE:", round(rmse, 2)))
+print(paste("Regression Model MAE:", round(mae, 2)))
+
+
+if (!is.null(reg_tree_model$variable.importance)) {
+  var_importance <- data.frame(
+    Variable = names(reg_tree_model$variable.importance),
+    Importance = as.numeric(reg_tree_model$variable.importance)
+  ) %>%
+    arrange(desc(Importance))
+  
+  print("Variable Importance for Regression Model:")
+  print(var_importance)
+} else {
+  print("No variable importance scores available")
+}
+
+# diagnostic plot
+plot(test_data$next_month_acres, predictions,
+     xlab = "Actual Next Month Acres Burned",
+     ylab = "Predicted Next Month Acres Burned",
+     main = "Regression Model: Predicted vs Actual Acres Burned",
+     pch = 19,
+     col = rgb(0, 0, 1, 0.5))
+abline(a = 0, b = 1, col = "red", lwd = 2)
+```
+
+
+**MAIN WORKING CLASSIFICATION DECISION TREE BELOW** 
+(log transformed total acres burned & using classification above or below the median)
+FOR MODEL COMPARISON & CONSISTENCY: Keeping same feature set as the logistic regression (tests done further down in the Rmd file), removing insignificant variables (tmin, prev_month_burned, MONTH, and county_risk_level)
+
+```{r}
+# make features and target for next month with log transformation
+merged_county_fires_weather <- merged_county_fires_weather %>%
+  group_by(THE_COUNTY) %>%
+  arrange(YEAR, MONTH) %>%
+  mutate(
+    # log transform 
+    log_acres = log(total_acres_burned + 1),
+    log_next_month_acres = log(next_month_acres + 1),
+    
+    # make  features w log-transformed values
+    roll_mean_prcp = (total_prcp + lag(total_prcp, 1) + lag(total_prcp, 2))/3,
+    roll_mean_tmax = (tmax + lag(tmax, 1) + lag(tmax, 2))/3,
+    
+    #  county-specific historical features w log transformation
+    county_avg_fires = mean(log_acres, na.rm = TRUE),
+    monthly_historical_avg = ave(log_acres, MONTH, FUN = mean),
+    
+    # binary target 
+    fire_next_month = as.factor(if_else(log_next_month_acres > 
+      median(log_next_month_acres, na.rm = TRUE), "yes", "no"))
+  ) %>%
+  ungroup()
+
+# train and evaluate for each county
+train_county_dt <- function(county_data, split_year) {
+
+  dt_train_data <- county_data %>% 
+    filter(YEAR <= split_year) %>%
+    select(fire_next_month, total_prcp, tmax, tmin, 
+            roll_mean_prcp, roll_mean_tmax,
+           county_avg_fires, monthly_historical_avg) %>%
+    na.omit()
+  
+  dt_test_data <- county_data %>%
+    filter(YEAR > split_year) %>%
+    select(fire_next_month, total_prcp, tmax, tmin,
+          roll_mean_prcp, roll_mean_tmax,
+           county_avg_fires, monthly_historical_avg) %>%
+    na.omit()
+  
+  if(nrow(dt_train_data) < 30 || nrow(dt_test_data) < 10) {
+    return(NULL)
+  }
+  
+
+  # check for single-class case - no longer a thing since log normalised actually
+unique_classes_train <- unique(dt_train_data$fire_next_month)
+
+  
+  # regular case - multiple classes 
+  dt_model <- rpart(
+    fire_next_month ~ .,
+    data = dt_train_data,
+    method = "class",
+    control = rpart.control(
+      cp = 0.001,
+      minsplit = 20,
+      minbucket = 10,
+      maxdepth = 12
+    ),
+    parms = list(
+      prior = c(0.5, 0.5),
+      split = "information"
+    )
+  )
+  
+  dt_predictions <- predict(dt_model, dt_test_data, type = "class")
+  dt_prob_predictions <- predict(dt_model, dt_test_data, type = "prob")[,"yes"]
+  
+  dt_conf_matrix <- table(Predicted = dt_predictions, Actual = dt_test_data$fire_next_month)
+  
+  dt_metrics <- list(
+    accuracy = sum(diag(dt_conf_matrix))/sum(dt_conf_matrix),
+    precision = dt_conf_matrix["yes","yes"]/sum(dt_conf_matrix["yes",]),
+    recall = dt_conf_matrix["yes","yes"]/sum(dt_conf_matrix[,"yes"]),
+    auc = auc(roc(dt_test_data$fire_next_month, dt_prob_predictions))
+  )
+  
+  dt_results <- data.frame(
+    actual = dt_test_data$fire_next_month,
+    predicted = dt_predictions,
+    predicted_prob = dt_prob_predictions,
+    year = county_data$YEAR[county_data$YEAR > split_year][1:length(dt_predictions)],
+    month = county_data$MONTH[county_data$YEAR > split_year][1:length(dt_predictions)]
+  )
+  
+  return(list(
+    model = dt_model,
+    metrics = dt_metrics,
+    importance = dt_model$variable.importance,
+    predictions = dt_results,
+    single_class = FALSE
+  ))
+}
+
+# train global model for whole of california so can compare diff models, rather than doing 58 separate plots for each county and making comparisons
+split_year <- quantile(unique(merged_county_fires_weather$YEAR), 0.8)
+
+# california global train/test sets
+dt_global_train <- merged_county_fires_weather %>% 
+  filter(YEAR <= split_year) %>% 
+  select(fire_next_month, total_prcp, tmax, tmin, THE_COUNTY, 
+         roll_mean_prcp, roll_mean_tmax,
+         county_avg_fires, monthly_historical_avg) %>%
+  na.omit()
+
+dt_global_test <- merged_county_fires_weather %>% 
+  filter(YEAR > split_year) %>%
+  select(fire_next_month, total_prcp, tmax,tmin, THE_COUNTY, 
+         roll_mean_prcp, roll_mean_tmax,
+         county_avg_fires, monthly_historical_avg) %>%
+  na.omit()
+
+#  global model training
+dt_global_model <- rpart(
+  fire_next_month ~ .,
+  data = dt_global_train,
+  method = "class",
+  control = rpart.control(
+    cp = 0.001,
+    minsplit = 20,
+    minbucket = 10,
+    maxdepth = 12
+  ),
+  parms = list(
+    prior = c(0.5, 0.5),
+    split = "information"
+  )
+)
+
+# county-specific models training
+dt_county_models <- merged_county_fires_weather %>%
+  group_by(THE_COUNTY) %>%
+  group_split() %>%
+  setNames(unique(merged_county_fires_weather$THE_COUNTY)) %>%
+  purrr::map(~train_county_dt(.x, split_year))
+
+# compile results
+dt_county_results <- data.frame(
+  county = names(dt_county_models)[!sapply(dt_county_models, is.null)],
+  accuracy = map_dbl(dt_county_models[!sapply(dt_county_models, is.null)], ~.x$metrics$accuracy),
+  precision = map_dbl(dt_county_models[!sapply(dt_county_models, is.null)], ~.x$metrics$precision),
+  recall = map_dbl(dt_county_models[!sapply(dt_county_models, is.null)], ~.x$metrics$recall),
+  auc = map_dbl(dt_county_models[!sapply(dt_county_models, is.null)], ~.x$metrics$auc)
+)
+
+
+# global model results + metrics
+dt_global_predictions <- predict(dt_global_model, dt_global_test, type = "class")
+dt_global_prob_predictions <- predict(dt_global_model, dt_global_test, type = "prob")[,"yes"]
+dt_global_conf_matrix <- table(Predicted = dt_global_predictions, Actual = dt_global_test$fire_next_month)
+
+dt_global_metrics <- list(
+  accuracy = sum(diag(dt_global_conf_matrix))/sum(dt_global_conf_matrix),
+  precision = dt_global_conf_matrix["yes","yes"]/sum(dt_global_conf_matrix["yes",]),
+  recall = dt_global_conf_matrix["yes","yes"]/sum(dt_global_conf_matrix[,"yes"])
+)
+
+dt_global_metrics$f1 <- 2 * (dt_global_metrics$precision * dt_global_metrics$recall) / 
+                        (dt_global_metrics$precision + dt_global_metrics$recall)
+dt_global_metrics$auc <- auc(roc(dt_global_test$fire_next_month, dt_global_prob_predictions))
+
+print("Decision Tree Global Model Results:")
+print("Confusion Matrix:")
+print(dt_global_conf_matrix)
+print(paste("Accuracy:", round(dt_global_metrics$accuracy, 3)))
+print(paste("Precision:", round(dt_global_metrics$precision, 3)))
+print(paste("Recall:", round(dt_global_metrics$recall, 3)))
+print(paste("F1 Score:", round(dt_global_metrics$f1, 3)))
+print(paste("AUC:", round(dt_global_metrics$auc, 3)))
+
+print("\nDecision Tree County-level Performance Summary:")
+print(dt_county_results %>% 
+        arrange(-accuracy) %>%
+        mutate(across(where(is.numeric), ~round(., 3))) %>%
+        select(county, everything()))
+
+# importance for global model
+dt_importance <- data.frame(
+  variable = names(dt_global_model$variable.importance),
+  importance = dt_global_model$variable.importance
+) %>%
+  arrange(-importance)
+
+print("\nDecision Tree Global Model Variable Importance:")
+print(dt_importance)
+
+#  visualisations
+ggplot(dt_county_results, aes(x = reorder(county, accuracy), y = accuracy)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  labs(title = "Decision Tree Model Accuracy by County",
+       x = "County",
+       y = "Accuracy") +
+  theme_minimal()
+
+# ROC curve for global 
+dt_roc_obj <- roc(dt_global_test$fire_next_month, dt_global_prob_predictions)
+plot(dt_roc_obj, main = "ROC Curve - Decision Tree Global Model")
+
+
+# cleaning 
+dt_importance_plot <- dt_importance %>%
+  mutate(
+    variable = case_when(
+      variable == "monthly_historical_avg" ~ "Monthly Historical Average",
+      variable == "county_avg_fires" ~ "County Average Fires",
+      variable == "roll_mean_tmax" ~ "Rolling Mean Max Temp",
+      variable == "roll_mean_prcp" ~ "Rolling Mean Precipitation",
+      variable == "tmax" ~ "Maximum Temperature",
+      variable == "tmin" ~ "Minimum Temperature", 
+      variable == "total_prcp" ~ "Total Precipitation",
+      variable == "THE_COUNTY" ~ "County",
+      TRUE ~ variable
+    ),
+    
+    importance_pct = (importance/max(importance)) * 100
+  ) %>%
+
+  arrange(importance_pct)
+
+ggplot(dt_importance_plot, 
+       aes(x = reorder(variable, importance_pct), 
+           y = importance_pct)) +
+  geom_bar(stat = "identity", 
+           fill = "#9DB5B2",
+           alpha = 0.8) +
+  coord_flip() +  
+  theme_minimal() +
+  labs(
+    title = "Feature Importance in Global Fire Prediction Model",
+    subtitle = "Relative importance of features in predicting next month's fire activity",
+    x = NULL,  # Remove x axis label since variable names are self-expl.
+    y = "Relative Importance (%)"
+  ) +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(size = 10, color = "grey40"),
+    axis.text = element_text(size = 10),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+
+ggsave("feature_importance.png", 
+       width = 10, 
+       height = 6, 
+       dpi = 300)
+
+```
+
+**Logistic Regression**
+```{r}
+merged_county_fires_weather <- merged_county_fires_weather %>%
+  group_by(THE_COUNTY) %>%
+  arrange(YEAR, MONTH) %>%
+  mutate(
+    log_acres = log(total_acres_burned + 1),
+    log_next_month_acres = log(next_month_acres + 1),
+    
+    prev_month_burned = lag(total_acres_burned, 1),
+    roll_mean_prcp = (total_prcp + lag(total_prcp, 1) + lag(total_prcp, 2)) / 3,
+    roll_mean_tmax = (tmax + lag(tmax, 1) + lag(tmax, 2)) / 3,
+    
+    county_risk_level = ntile(mean(log_acres, na.rm = TRUE), 4),
+    monthly_historical_avg = ave(log_acres, MONTH, FUN = mean),
+    county_avg_fires = mean(log_acres, na.rm = TRUE),
+   
+    fire_next_month = as.factor(if_else(log_next_month_acres > median(log_acres, na.rm = TRUE), "yes", "no"))
+  ) %>%
+  ungroup()
+
+# GLOBAL
+# 80th percentile of YEAR to capture temporarl patterns
+split_year <- quantile(unique(merged_county_fires_weather$YEAR), 0.8)
+
+global_train_data <- merged_county_fires_weather %>% 
+  filter(YEAR <= split_year) %>% 
+  select(fire_next_month, total_prcp, tmax, tmin, THE_COUNTY, 
+         MONTH, roll_mean_prcp, roll_mean_tmax, prev_month_burned,
+         county_avg_fires, county_risk_level, monthly_historical_avg) %>%
+  na.omit()
+
+global_test_data <- merged_county_fires_weather %>% 
+  filter(YEAR > split_year) %>% 
+  select(fire_next_month, total_prcp, tmax, tmin, THE_COUNTY, 
+         MONTH, roll_mean_prcp, roll_mean_tmax, prev_month_burned,
+         county_avg_fires, county_risk_level, monthly_historical_avg) %>%
+  na.omit()
+
+# global logistic regression model
+global_lr <- glm(fire_next_month ~ ., data = global_train_data, family = binomial)
+
+# predictions on the test set
+global_prob_predictions_lr <- predict(global_lr, global_test_data, type = "response")
+global_predictions_lr <- factor(ifelse(global_prob_predictions_lr > 0.5, "yes", "no"), levels = c("no", "yes"))
+global_conf_matrix <- table(Predicted = global_predictions_lr, Actual = global_test_data$fire_next_month)
+
+# performance metrics
+global_metrics <- list(
+  accuracy = sum(diag(global_conf_matrix)) / sum(global_conf_matrix),
+  precision = global_conf_matrix["yes", "yes"] / sum(global_conf_matrix["yes", ]),
+  recall = global_conf_matrix["yes", "yes"] / sum(global_conf_matrix[,"yes"]),
+  auc = auc(roc(global_test_data$fire_next_month, global_prob_predictions_lr)),
+  aic = AIC(global_lr)  # Add AIC here
+)
+global_metrics$f1 <- 2 * (global_metrics$precision * global_metrics$recall) / 
+                       (global_metrics$precision + global_metrics$recall)
+
+print("Global Logistic Regression Model Results:")
+print("Confusion Matrix:")
+print(global_conf_matrix)
+cat("Accuracy:", round(global_metrics$accuracy, 3), "\n")
+cat("Precision:", round(global_metrics$precision, 3), "\n")
+cat("Recall:", round(global_metrics$recall, 3), "\n")
+cat("F1 Score:", round(global_metrics$f1, 3), "\n")
+cat("AUC:", round(global_metrics$auc, 3), "\n")
+cat("AIC:", round(global_metrics$aic, 3), "\n")
+
+roc_obj_lr <- roc(global_test_data$fire_next_month, global_prob_predictions_lr)
+plot(roc_obj_lr, main = "ROC Curve - Global Logistic Regression Model", 
+     col = "blue", lwd = 2, xlab = "1 - Specificity", ylab = "Sensitivity")
+legend("bottomright", legend = paste("AUC =", round(global_metrics$auc, 3)), col = "blue", lwd = 2)
+
+# COUNTY
+train_county_lr <- function(county_data, split_year) {
+  train_data <- county_data %>% 
+    filter(YEAR <= split_year) %>%
+    select(fire_next_month, total_prcp, tmax, tmin, 
+           MONTH, roll_mean_prcp, roll_mean_tmax, prev_month_burned,
+           monthly_historical_avg) %>%
+    na.omit()
+  
+  test_data <- county_data %>%
+    filter(YEAR > split_year) %>%
+    select(fire_next_month, total_prcp, tmax, tmin,
+           MONTH, roll_mean_prcp, roll_mean_tmax, prev_month_burned,
+           monthly_historical_avg) %>%
+    na.omit()
+  
+  if(nrow(train_data) < 30 || nrow(test_data) < 10) return(NULL)
+  
+  model_lr <- glm(fire_next_month ~ ., data = train_data, family = binomial)
+  prob_predictions <- predict(model_lr, test_data, type = "response")
+  predictions <- factor(ifelse(prob_predictions > 0.5, "yes", "no"), levels = c("no", "yes"))
+  
+  conf_matrix <- table(Predicted = predictions, Actual = test_data$fire_next_month)
+  
+  metrics <- list(
+    accuracy = sum(diag(conf_matrix)) / sum(conf_matrix),
+    precision = conf_matrix["yes", "yes"] / sum(conf_matrix["yes", ]),
+    recall = conf_matrix["yes", "yes"] / sum(conf_matrix[,"yes"]),
+    auc = auc(roc(test_data$fire_next_month, prob_predictions)),
+    aic = AIC(model_lr)  # Add AIC for county model
+  )
+  
+  results <- data.frame(
+    actual = test_data$fire_next_month,
+    predicted = predictions,
+    predicted_prob = prob_predictions,
+    year = county_data$YEAR[county_data$YEAR > split_year][1:length(predictions)],
+    month = county_data$MONTH[county_data$YEAR > split_year][1:length(predictions)]
+  )
+  
+  return(list(
+    model = model_lr,
+    metrics = metrics,
+    importance = coef(model_lr),
+    predictions = results,
+    single_class = FALSE
+  ))
+}
+
+county_lr_models <- merged_county_fires_weather %>%
+  group_by(THE_COUNTY) %>%
+  group_split() %>%
+  setNames(unique(merged_county_fires_weather$THE_COUNTY)) %>%
+  purrr::map(~train_county_lr(.x, split_year))
+
+lr_county_results <- data.frame(
+  county = names(county_lr_models)[!sapply(county_lr_models, is.null)],
+  accuracy = map_dbl(county_lr_models[!sapply(county_lr_models, is.null)], ~.x$metrics$accuracy),
+  precision = map_dbl(county_lr_models[!sapply(county_lr_models, is.null)], ~.x$metrics$precision),
+  recall = map_dbl(county_lr_models[!sapply(county_lr_models, is.null)], ~.x$metrics$recall),
+  auc = map_dbl(county_lr_models[!sapply(county_lr_models, is.null)], ~.x$metrics$auc),
+  aic = map_dbl(county_lr_models[!sapply(county_lr_models, is.null)], ~.x$metrics$aic)
+)
+
+print("\nCounty-level Performance Summary for Logistic Regression:")
+print(lr_county_results %>% 
+        arrange(desc(accuracy)) %>%
+        mutate(across(where(is.numeric), ~round(., 3))))
+
+ggplot(lr_county_results, aes(x = reorder(county, accuracy), y = accuracy)) +
+  geom_bar(stat = "identity", fill = "#9DB5B2") +
+  coord_flip() +
+  labs(title = "Logistic Regression Model Accuracy by County", x = "County", y = "Accuracy") +
+  theme_minimal()
+
+
+lr_summary <- summary(global_lr)
+
+# removing the intercept row and create a data frame with the absolute z-values 
+lr_importance <- data.frame(
+  variable = rownames(lr_summary$coefficients)[-1],
+  importance = abs(lr_summary$coefficients[-1, "z value"])
+) %>%
+  arrange(desc(importance))
+
+print("Global Logistic Regression Feature Importance:")
+print(lr_importance)
+
+
+lr_importance_plot <- lr_importance %>%
+  mutate(
+    variable = case_when(
+      variable == "monthly_historical_avg" ~ "Monthly Historical Average",
+      variable == "county_avg_fires" ~ "County Average Fires",
+      variable == "roll_mean_tmax" ~ "Rolling Mean Max Temp",
+      variable == "roll_mean_prcp" ~ "Rolling Mean Precipitation",
+      variable == "tmax" ~ "Maximum Temperature",
+      variable == "tmin" ~ "Minimum Temperature", 
+      variable == "total_prcp" ~ "Total Precipitation",
+      variable == "THE_COUNTY" ~ "County",
+      TRUE ~ variable
+    ),
+    importance_pct = (importance / max(importance)) * 100
+  ) %>%
+  arrange(importance_pct)
+
+ggplot(lr_importance_plot, 
+       aes(x = reorder(variable, importance_pct), y = importance_pct)) +
+  geom_bar(stat = "identity", fill = "#9DB5B2", alpha = 0.8) +
+  coord_flip() +
+  labs(
+    title = "Feature Importance in Global Logistic Regression Model",
+    subtitle = "Relative importance based on absolute z-values",
+    x = NULL,
+    y = "Relative Importance (%)"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(size = 10, color = "grey40"),
+    axis.text = element_text(size = 10),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+
+ggsave("lr_feature_importance.png", width = 10, height = 6, dpi = 300)
+
+```
+
+**Measuring Results**
+
+```{r}
+
+# global model results
+print("Global Logistic Regression Model Results:")
+print("Confusion Matrix:")
+print(global_conf_matrix)
+cat("Accuracy:", round(global_metrics$accuracy, 3), "\n")
+cat("Precision:", round(global_metrics$precision, 3), "\n")
+cat("Recall:", round(global_metrics$recall, 3), "\n")
+cat("F1 Score:", round(global_metrics$f1, 3), "\n")
+cat("AUC:", round(global_metrics$auc, 3), "\n")
+cat("AIC:", round(global_metrics$aic, 3), "\n")
+
+```
+
+
+
+Logistic regression but checking statistical significance of all features
+```{r}
+
+print("Summary of Global Logistic Regression Model:")
+print(summary(global_lr))
+
+
+```
+
+
+```{r}
+lr_importance_no_county <- lr_importance %>%
+  filter(variable != "THE_COUNTY") %>%
+  arrange(desc(importance))
+
+print("Logistic Regression Feature Importance (excluding County):")
+print(lr_importance_no_county)
+```
+
+
+Logistic regression, checking statistical significance after removing previously found insignificant feature (prev_month_burned + tmin here)
+```{r}
+
+# Prep the data but the global model selection excludes prev_month_burned and tmin
+merged_county_fires_weather <- merged_county_fires_weather %>%
+  group_by(THE_COUNTY) %>%
+  arrange(YEAR, MONTH) %>%
+  mutate(
+    log_acres = log(total_acres_burned + 1),
+    log_next_month_acres = log(next_month_acres + 1),
+    
+    roll_mean_prcp = (total_prcp + lag(total_prcp, 1) + lag(total_prcp, 2)) / 3,
+    roll_mean_tmax = (tmax + lag(tmax, 1) + lag(tmax, 2)) / 3,
+    
+    county_risk_level = ntile(mean(log_acres, na.rm = TRUE), 4),
+    monthly_historical_avg = ave(log_acres, MONTH, FUN = mean),
+    county_avg_fires = mean(log_acres, na.rm = TRUE),
+    
+    fire_next_month = as.factor(if_else(log_next_month_acres > 
+      median(log_acres, na.rm = TRUE), "yes", "no"))
+  ) %>%
+  ungroup()
+
+split_year <- quantile(unique(merged_county_fires_weather$YEAR), 0.8)
+
+global_train_data_reduced <- merged_county_fires_weather %>% 
+  filter(YEAR <= split_year) %>% 
+  select(fire_next_month, total_prcp, tmax, THE_COUNTY, 
+         MONTH, roll_mean_prcp, roll_mean_tmax, 
+         county_risk_level, monthly_historical_avg) %>%
+  na.omit()
+
+global_test_data_reduced <- merged_county_fires_weather %>% 
+  filter(YEAR > split_year) %>% 
+  select(fire_next_month, total_prcp, tmax, THE_COUNTY, 
+         MONTH, roll_mean_prcp, roll_mean_tmax, 
+         county_risk_level, monthly_historical_avg) %>%
+  na.omit()
+
+global_lr_reduced <- glm(fire_next_month ~ ., data = global_train_data_reduced, family = binomial)
+
+global_prob_predictions_reduced <- predict(global_lr_reduced, global_test_data_reduced, type = "response")
+global_predictions_reduced <- factor(ifelse(global_prob_predictions_reduced > 0.5, "yes", "no"), levels = c("no", "yes"))
+global_conf_matrix_reduced <- table(Predicted = global_predictions_reduced, Actual = global_test_data_reduced$fire_next_month)
+
+global_metrics_reduced <- list(
+  accuracy  = sum(diag(global_conf_matrix_reduced)) / sum(global_conf_matrix_reduced),
+  precision = global_conf_matrix_reduced["yes", "yes"] / sum(global_conf_matrix_reduced["yes", ]),
+  recall    = global_conf_matrix_reduced["yes", "yes"] / sum(global_conf_matrix_reduced[,"yes"]),
+  aic       = AIC(global_lr_reduced)  # AIC added here
+)
+global_metrics_reduced$f1 <- 2 * (global_metrics_reduced$precision * global_metrics_reduced$recall) / 
+                             (global_metrics_reduced$precision + global_metrics_reduced$recall)
+global_metrics_reduced$auc <- auc(roc(global_test_data_reduced$fire_next_month, global_prob_predictions_reduced))
+
+cat("Global Logistic Regression Model (Without prev_month_burned and tmin) Results:\n")
+cat("Confusion Matrix:\n")
+print(global_conf_matrix_reduced)
+cat(paste("Accuracy:", round(global_metrics_reduced$accuracy, 3), "\n"))
+cat(paste("Precision:", round(global_metrics_reduced$precision, 3), "\n"))
+cat(paste("Recall:", round(global_metrics_reduced$recall, 3), "\n"))
+cat(paste("F1 Score:", round(global_metrics_reduced$f1, 3), "\n"))
+cat(paste("AUC:", round(global_metrics_reduced$auc, 3), "\n"))
+cat(paste("AIC:", round(global_metrics_reduced$aic, 3), "\n\n"))
+
+cat("Summary of Reduced Global Logistic Regression Model:\n")
+print(summary(global_lr_reduced))
+
+```
+Logistic regression but now we remove both prev_month_burned, county risk level, and tmin.
+```{r}
+
+merged_county_fires_weather <- merged_county_fires_weather %>%
+  group_by(THE_COUNTY) %>%
+  arrange(YEAR, MONTH) %>%
+  mutate(
+    log_acres = log(total_acres_burned + 1),
+    log_next_month_acres = log(next_month_acres + 1),
+    
+    roll_mean_prcp = (total_prcp + lag(total_prcp, 1) + lag(total_prcp, 2)) / 3,
+    roll_mean_tmax = (tmax + lag(tmax, 1) + lag(tmax, 2)) / 3,
+    
+    monthly_historical_avg = ave(log_acres, MONTH, FUN = mean),
+    county_avg_fires = mean(log_acres, na.rm = TRUE),
+    
+    fire_next_month = as.factor(if_else(log_next_month_acres > 
+      median(log_acres, na.rm = TRUE), "yes", "no"))
+  ) %>%
+  ungroup()
+
+split_year <- quantile(unique(merged_county_fires_weather$YEAR), 0.8)
+
+global_train_data_reduced <- merged_county_fires_weather %>% 
+  filter(YEAR <= split_year) %>% 
+  select(fire_next_month, total_prcp, tmax, THE_COUNTY, 
+         roll_mean_prcp, roll_mean_tmax, monthly_historical_avg) %>%
+  na.omit()
+
+global_test_data_reduced <- merged_county_fires_weather %>% 
+  filter(YEAR > split_year) %>% 
+  select(fire_next_month, total_prcp, tmax, THE_COUNTY, 
+         roll_mean_prcp, roll_mean_tmax, monthly_historical_avg) %>%
+  na.omit()
+
+global_lr_reduced <- glm(fire_next_month ~ ., data = global_train_data_reduced, family = binomial)
+
+global_prob_predictions_reduced <- predict(global_lr_reduced, global_test_data_reduced, type = "response")
+global_predictions_reduced <- factor(ifelse(global_prob_predictions_reduced > 0.5, "yes", "no"), levels = c("no", "yes"))
+global_conf_matrix_reduced <- table(Predicted = global_predictions_reduced, Actual = global_test_data_reduced$fire_next_month)
+
+global_metrics_reduced <- list(
+  accuracy  = sum(diag(global_conf_matrix_reduced)) / sum(global_conf_matrix_reduced),
+  precision = global_conf_matrix_reduced["yes", "yes"] / sum(global_conf_matrix_reduced["yes", ]),
+  recall    = global_conf_matrix_reduced["yes", "yes"] / sum(global_conf_matrix_reduced[,"yes"]),
+  f1        = 2 * ( (global_conf_matrix_reduced["yes", "yes"] / sum(global_conf_matrix_reduced["yes", ])) *
+                    (global_conf_matrix_reduced["yes", "yes"] / sum(global_conf_matrix_reduced[,"yes"])) ) /
+                    ((global_conf_matrix_reduced["yes", "yes"] / sum(global_conf_matrix_reduced["yes", ])) +
+                     (global_conf_matrix_reduced["yes", "yes"] / sum(global_conf_matrix_reduced[,"yes"]))),
+  auc       = auc(roc(global_test_data_reduced$fire_next_month, global_prob_predictions_reduced)),
+  aic       = AIC(global_lr_reduced)
+)
+
+cat("Global Logistic Regression Model (Excluding prev_month_burned, tmin, MONTH, county_risk_level) Results:\n")
+cat("Confusion Matrix:\n")
+print(global_conf_matrix_reduced)
+cat(paste("Accuracy:", round(global_metrics_reduced$accuracy, 3), "\n"))
+cat(paste("Precision:", round(global_metrics_reduced$precision, 3), "\n"))
+cat(paste("Recall:", round(global_metrics_reduced$recall, 3), "\n"))
+cat(paste("F1 Score:", round(global_metrics_reduced$f1, 3), "\n"))
+cat(paste("AUC:", round(global_metrics_reduced$auc, 3), "\n"))
+cat(paste("AIC:", round(global_metrics_reduced$aic, 3), "\n\n"))
+
+print(global_metrics_reduced)
+
+cat("\nSummary of Reduced Global Logistic Regression Model:\n")
+print(summary(global_lr_reduced))
+
+
+lr_roc_obj <- roc(global_test_data_reduced$fire_next_month, global_prob_predictions_reduced)
+plot(lr_roc_obj, main = "ROC Curve - Global Logistic Regression Model", col = "blue", lwd = 2)
+legend("bottomright", legend = paste("AUC =", round(global_metrics_reduced$auc, 3)), col = "blue", lwd = 2)
+
+```
+**LR Reduced WITH TMIN**
+Logistic regression removing insignificant variables (prev_month_burned, MONTH, and county_risk_level) We included tmin again as it became significant when we did log transformation 
+```{r}
+
+data_clean <- merged_county_fires_weather %>%
+  group_by(THE_COUNTY) %>%
+  arrange(YEAR, MONTH) %>%
+  mutate(
+    log_acres = log(total_acres_burned + 1),
+    log_next_month_acres = log(next_month_acres + 1),
+    
+    roll_mean_prcp = (total_prcp + lag(total_prcp, 1) + lag(total_prcp, 2)) / 3,
+    roll_mean_tmax = (tmax + lag(tmax, 1) + lag(tmax, 2)) / 3,
+    
+    monthly_historical_avg = ave(log_acres, MONTH, FUN = mean),
+    county_avg_fires = mean(log_acres, na.rm = TRUE),
+    
+    fire_next_month = as.factor(if_else(log_next_month_acres > 
+      median(log_acres, na.rm = TRUE), "yes", "no"))
+  ) %>%
+  ungroup()
+
+split_year_clean <- quantile(unique(data_clean$YEAR), 0.8)
+
+train_data_clean <- data_clean %>% 
+  filter(YEAR <= split_year_clean) %>% 
+  select(fire_next_month, total_prcp, tmax, tmin, THE_COUNTY, 
+         roll_mean_prcp, roll_mean_tmax, monthly_historical_avg) %>%
+  na.omit()
+
+test_data_clean <- data_clean %>% 
+  filter(YEAR > split_year_clean) %>% 
+  select(fire_next_month, total_prcp, tmax, tmin, THE_COUNTY, 
+         roll_mean_prcp, roll_mean_tmax, monthly_historical_avg) %>%
+  na.omit()
+
+lr_model_clean <- glm(fire_next_month ~ ., data = train_data_clean, family = binomial)
+
+prob_predictions_clean <- predict(lr_model_clean, test_data_clean, type = "response")
+predictions_clean <- factor(ifelse(prob_predictions_clean > 0.5, "yes", "no"), levels = c("no", "yes"))
+conf_matrix_clean <- table(Predicted = predictions_clean, Actual = test_data_clean$fire_next_month)
+
+metrics_clean <- list(
+  accuracy  = sum(diag(conf_matrix_clean)) / sum(conf_matrix_clean),
+  precision = conf_matrix_clean["yes", "yes"] / sum(conf_matrix_clean["yes", ]),
+  recall    = conf_matrix_clean["yes", "yes"] / sum(conf_matrix_clean[,"yes"]),
+  f1        = 2 * ((conf_matrix_clean["yes", "yes"] / sum(conf_matrix_clean["yes", ])) *
+                    (conf_matrix_clean["yes", "yes"] / sum(conf_matrix_clean[,"yes"]))) /
+                    ((conf_matrix_clean["yes", "yes"] / sum(conf_matrix_clean["yes", ])) +
+                     (conf_matrix_clean["yes", "yes"] / sum(conf_matrix_clean[,"yes"]))),
+  auc       = auc(roc(test_data_clean$fire_next_month, prob_predictions_clean)),
+  aic       = AIC(lr_model_clean)
+)
+
+# COUNTY
+clean_train_county_lr <- function(county_data, split_year) {
+  train_data <- county_data %>% 
+    filter(YEAR <= split_year) %>%
+    select(fire_next_month, total_prcp, tmax, tmin, 
+           MONTH, roll_mean_prcp, roll_mean_tmax,
+           monthly_historical_avg) %>%
+    na.omit()
+  
+  test_data <- county_data %>%
+    filter(YEAR > split_year) %>%
+    select(fire_next_month, total_prcp, tmax, tmin,
+           MONTH, roll_mean_prcp, roll_mean_tmax,
+           monthly_historical_avg) %>%
+    na.omit()
+  
+  if(nrow(train_data) < 30 || nrow(test_data) < 10) return(NULL)
+  
+  clean_model_lr <- glm(fire_next_month ~ ., data = train_data, family = binomial)
+  clean_prob_predictions <- predict(clean_model_lr, test_data, type = "response")
+  clean_predictions <- factor(ifelse(clean_prob_predictions > 0.5, "yes", "no"), levels = c("no", "yes"))
+  
+  conf_matrix <- table(Predicted = clean_predictions, Actual = test_data$fire_next_month)
+  
+  clean_metrics <- list(
+    accuracy = sum(diag(conf_matrix)) / sum(conf_matrix),
+    precision = conf_matrix["yes", "yes"] / sum(conf_matrix["yes", ]),
+    recall = conf_matrix["yes", "yes"] / sum(conf_matrix[,"yes"]),
+    auc = auc(roc(test_data$fire_next_month, prob_predictions)),
+    aic = AIC(model_lr)  # Add AIC for county model
+  )
+  
+  clean_results <- data.frame(
+    actual = test_data$fire_next_month,
+    predicted = predictions,
+    predicted_prob = prob_predictions,
+    year = county_data$YEAR[county_data$YEAR > split_year][1:length(clean_predictions)],
+    month = county_data$MONTH[county_data$YEAR > split_year][1:length(clean_predictions)]
+  )
+  
+  return(list(
+    model = clean_model_lr,
+    metrics = clean_metrics,
+    importance = coef(clean_model_lr),
+    predictions = clean_results,
+    single_class = FALSE
+  ))
+}
+
+county_lr_models <- merged_county_fires_weather %>%
+  group_by(THE_COUNTY) %>%
+  group_split() %>%
+  setNames(unique(merged_county_fires_weather$THE_COUNTY)) %>%
+  purrr::map(~train_county_lr(.x, split_year))
+
+clean_lr_county_results <- data.frame(
+  county = names(county_lr_models)[!sapply(county_lr_models, is.null)],
+  accuracy = map_dbl(county_lr_models[!sapply(county_lr_models, is.null)], ~.x$metrics$accuracy),
+  precision = map_dbl(county_lr_models[!sapply(county_lr_models, is.null)], ~.x$metrics$precision),
+  recall = map_dbl(county_lr_models[!sapply(county_lr_models, is.null)], ~.x$metrics$recall),
+  auc = map_dbl(county_lr_models[!sapply(county_lr_models, is.null)], ~.x$metrics$auc),
+  aic = map_dbl(county_lr_models[!sapply(county_lr_models, is.null)], ~.x$metrics$aic)
+)
+
+print("\nCounty-level Performance Summary for Logistic Regression:")
+print(clean_lr_county_results %>% 
+        arrange(desc(accuracy)) %>%
+        mutate(across(where(is.numeric), ~round(., 3))))
+
+ggplot(clean_lr_county_results, aes(x = reorder(county, accuracy), y = accuracy)) +
+  geom_bar(stat = "identity", fill = "#9DB5B2") +
+  coord_flip() +
+  labs(title = "Logistic Regression Model Accuracy by County", x = "County", y = "Accuracy") +
+  theme_minimal()
+
+cat("Global Logistic Regression Model (Clean) Results (Excluding prev_month_burned, tmin, MONTH, county_risk_level):\n")
+cat("Confusion Matrix:\n")
+print(conf_matrix_clean)
+cat(paste("Accuracy:", round(metrics_clean$accuracy, 3), "\n"))
+cat(paste("Precision:", round(metrics_clean$precision, 3), "\n"))
+cat(paste("Recall:", round(metrics_clean$recall, 3), "\n"))
+cat(paste("F1 Score:", round(metrics_clean$f1, 3), "\n"))
+cat(paste("AUC:", round(metrics_clean$auc, 3), "\n"))
+cat(paste("AIC:", round(metrics_clean$aic, 3), "\n\n"))
+
+print(metrics_clean)
+
+cat("\nSummary of the Clean Global Logistic Regression Model:\n")
+print(summary(lr_model_clean))
+
+
+roc_obj_clean <- roc(test_data_clean$fire_next_month, prob_predictions_clean)
+plot(roc_obj_clean, main = "ROC Curve - Global Logistic Regression Model (Clean)", col = "blue", lwd = 2)
+legend("bottomright", legend = paste("AUC =", round(metrics_clean$auc, 3)), col = "blue", lwd = 2)
+
+# extracting coefficients and standard errors
+coef_summary <- summary(lr_model_clean)$coefficients
+lr_importance <- data.frame(
+  variable = rownames(coef_summary),
+  importance = abs(coef_summary[, "Estimate"] / coef_summary[, "Std. Error"])
+) %>%
+  filter(
+    variable != "(Intercept)" &
+    !grepl("THE_COUNTY", variable)
+  ) %>%
+  bind_rows(
+    data.frame(
+      variable = "THE_COUNTY",
+      importance = mean(abs(
+        coef_summary[grepl("THE_COUNTY", rownames(coef_summary)), "Estimate"] / 
+        coef_summary[grepl("THE_COUNTY", rownames(coef_summary)), "Std. Error"]
+      ))
+    )
+  ) %>%
+  arrange(-importance)
+
+lr_importance_plot <- lr_importance %>%
+  mutate(
+    variable = case_when(
+      variable == "monthly_historical_avg" ~ "Monthly Historical Average",
+      variable == "roll_mean_tmax" ~ "Rolling Mean Max Temp",
+      variable == "roll_mean_prcp" ~ "Rolling Mean Precipitation",
+      variable == "tmax" ~ "Maximum Temperature",
+      variable == "tmin" ~ "Minimum Temperature",
+      variable == "total_prcp" ~ "Total Precipitation",
+      variable == "THE_COUNTY" ~ "County",
+      TRUE ~ variable
+    ),
+    importance_pct = (importance/max(importance)) * 100
+  ) %>%
+  arrange(importance_pct)
+
+ggplot(lr_importance_plot, 
+       aes(x = reorder(variable, importance_pct), 
+           y = importance_pct)) +
+  geom_bar(stat = "identity", 
+           fill = "#9DB5B2",
+           alpha = 0.8) +
+  coord_flip() +  
+  theme_minimal() +
+  labs(
+    title = "Feature Importance in Global Fire Prediction Model",
+    subtitle = "Relative importance of features in predicting next month's fire activity",
+    x = NULL,
+    y = "Relative Importance (%)"
+  ) +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(size = 10, color = "grey40"),
+    axis.text = element_text(size = 10),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+
+ggsave("lr_feature_importance.png", 
+       width = 10, 
+       height = 6, 
+       dpi = 300)
+
+```
+```{r}
+cat(paste("Accuracy:", round(metrics_clean$accuracy, 3), "\n"))
+cat(paste("Precision:", round(metrics_clean$precision, 3), "\n"))
+cat(paste("Recall:", round(metrics_clean$recall, 3), "\n"))
+cat(paste("F1 Score:", round(metrics_clean$f1, 3), "\n"))
+cat(paste("AUC:", round(metrics_clean$auc, 3), "\n"))
+cat(paste("AIC:", round(metrics_clean$aic, 3), "\n\n"))
+```
+
+```{r}
+cat("\nSummary of Reduced Global Logistic Regression Model:\n")
+print(summary(global_lr_reduced))
+```
+
+
+
+**RANDOM FOREST**
+FOR MODEL COMPARISON & CONSISTENCY: Keeping same feature set as the logistic regression, removing insignificant variables (prev_month_burned, MONTH, and county_risk_level)
+
+```{r}
+# modified feature preparation
+merged_county_fires_weather <- merged_county_fires_weather %>%
+  group_by(THE_COUNTY) %>%
+  arrange(YEAR, MONTH) %>%
+  mutate(
+    log_acres = log(total_acres_burned + 1),
+    log_next_month_acres = log(next_month_acres + 1),
+    
+    roll_mean_prcp = (total_prcp + lag(total_prcp, 1) + lag(total_prcp, 2))/3,
+    roll_mean_tmax = (tmax + lag(tmax, 1) + lag(tmax, 2))/3,
+    
+    monthly_historical_avg = ave(log_acres, MONTH, FUN = mean),
+    
+    fire_next_month = as.factor(if_else(log_next_month_acres > 
+      median(log_acres, na.rm = TRUE), "yes", "no"))
+  ) %>%
+  ungroup()
+
+train_county_rf <- function(county_data, split_year) {
+  train_data <- county_data %>% 
+    filter(YEAR <= split_year) %>%
+    select(fire_next_month, total_prcp, tmax, tmin,
+           roll_mean_prcp, roll_mean_tmax,
+            monthly_historical_avg) %>%
+    na.omit()
+  
+  test_data <- county_data %>%
+    filter(YEAR > split_year) %>%
+    select(fire_next_month, total_prcp, tmax, tmin,
+           roll_mean_prcp, roll_mean_tmax,
+           monthly_historical_avg) %>%
+    na.omit()
+  
+  if(nrow(train_data) < 30 || nrow(test_data) < 10) {
+    return(NULL)
+  }
+  
+  unique_classes_train <- unique(train_data$fire_next_month)
+  
+  set.seed(123)
+  rf <- randomForest(
+    fire_next_month ~ .,
+    data = train_data,
+    ntree = 500,
+    mtry = 3,
+    sampsize = c(
+      yes = min(table(train_data$fire_next_month)),
+      no = min(table(train_data$fire_next_month))
+    ),
+    importance = TRUE
+  )
+  
+  predictions <- predict(rf, test_data)
+  prob_predictions <- predict(rf, test_data, type = "prob")[,"yes"]
+  
+  conf_matrix <- table(Predicted = predictions, Actual = test_data$fire_next_month)
+  
+  metrics <- list(
+    accuracy = sum(diag(conf_matrix))/sum(conf_matrix),
+    precision = conf_matrix["yes","yes"]/sum(conf_matrix["yes",]),
+    recall = conf_matrix["yes","yes"]/sum(conf_matrix[,"yes"]),
+    auc = auc(roc(test_data$fire_next_month, prob_predictions))
+  )
+  
+  results <- data.frame(
+    actual = test_data$fire_next_month,
+    predicted = predictions,
+    predicted_prob = prob_predictions,
+    year = county_data$YEAR[county_data$YEAR > split_year][1:length(predictions)],
+    month = county_data$MONTH[county_data$YEAR > split_year][1:length(predictions)]
+  )
+  
+  return(list(
+    model = rf,
+    metrics = metrics,
+    importance = importance(rf),
+    predictions = results,
+    single_class = FALSE
+  ))
+}
+
+split_year <- quantile(unique(merged_county_fires_weather$YEAR), 0.8)
+
+global_train_data <- merged_county_fires_weather %>% 
+  filter(YEAR <= split_year) %>% 
+  select(fire_next_month, total_prcp, tmax, tmin, THE_COUNTY, 
+        roll_mean_prcp, roll_mean_tmax,
+         county_avg_fires, monthly_historical_avg) %>%
+  na.omit()
+
+global_test_data <- merged_county_fires_weather %>% 
+  filter(YEAR > split_year) %>%
+  select(fire_next_month, total_prcp, tmax, tmin, THE_COUNTY, 
+          roll_mean_prcp, roll_mean_tmax,
+         county_avg_fires, monthly_historical_avg) %>%
+  na.omit()
+
+set.seed(123)
+global_rf <- randomForest(
+  fire_next_month ~ .,
+  data = global_train_data,
+  ntree = 500,
+  mtry = 4,
+  sampsize = c(
+    yes = min(table(global_train_data$fire_next_month)),
+    no = min(table(global_train_data$fire_next_month))
+  ),
+  importance = TRUE
+)
+
+county_models <- merged_county_fires_weather %>%
+  group_by(THE_COUNTY) %>%
+  group_split() %>%
+  setNames(unique(merged_county_fires_weather$THE_COUNTY)) %>%
+  purrr::map(~train_county_rf(.x, split_year))
+
+rf_county_results <- data.frame(
+  county = names(county_models)[!sapply(county_models, is.null)],
+  accuracy = map_dbl(county_models[!sapply(county_models, is.null)], ~.x$metrics$accuracy),
+  precision = map_dbl(county_models[!sapply(county_models, is.null)], ~.x$metrics$precision),
+  recall = map_dbl(county_models[!sapply(county_models, is.null)], ~.x$metrics$recall),
+  auc = map_dbl(county_models[!sapply(county_models, is.null)], ~.x$metrics$auc)
+)
+
+
+global_predictions_rf <- predict(global_rf, global_test_data)
+global_prob_predictions_rf <- predict(global_rf, global_test_data, type = "prob")[,"yes"]
+global_conf_matrix <- table(Predicted = global_predictions_rf, Actual = global_test_data$fire_next_month)
+
+rf_global_metrics <- list(
+  accuracy = sum(diag(global_conf_matrix))/sum(global_conf_matrix),
+  precision = global_conf_matrix["yes","yes"]/sum(global_conf_matrix["yes",]),
+  recall = global_conf_matrix["yes","yes"]/sum(global_conf_matrix[,"yes"])
+)
+
+# F1 score
+global_metrics$f1 <- 2 * (global_metrics$precision * global_metrics$recall) / 
+                        (global_metrics$precision + global_metrics$recall)
+
+# AUC
+global_metrics$auc <- auc(roc(global_test_data$fire_next_month, global_prob_predictions_rf))
+
+print("Global Model Results:")
+print("Confusion Matrix:")
+print(global_conf_matrix)
+print(paste("Accuracy:", round(global_metrics$accuracy, 3)))
+print(paste("Precision:", round(global_metrics$precision, 3)))
+print(paste("Recall:", round(global_metrics$recall, 3)))
+print(paste("F1 Score:", round(global_metrics$f1, 3)))
+print(paste("AUC:", round(global_metrics$auc, 3)))
+
+print("\nCounty-level Performance Summary:")
+print(rf_county_results %>% 
+        arrange(-accuracy) %>%
+        mutate(across(where(is.numeric), ~round(., 3))) %>%
+        select(county, everything()))
+
+importance_matrix <- importance(global_rf)
+importance_df <- data.frame(
+  variable = rownames(importance_matrix),
+  importance = importance_matrix[, "MeanDecreaseGini"]
+) %>%
+  arrange(-importance)
+
+print("\nGlobal Model Variable Importance:")
+print(importance_df)
+
+ggplot(rf_county_results, aes(x = reorder(county, accuracy), y = accuracy)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  labs(title = "Model Accuracy by County",
+       x = "County",
+       y = "Accuracy") +
+  theme_minimal()
+
+rf_roc_obj <- roc(global_test_data$fire_next_month, global_prob_predictions_rf)
+plot(rf_roc_obj, main = "ROC Curve - Global Model")
+
+
+# PLOTTING
+
+rf_importance_plot <- importance_df %>% 
+  mutate(
+    variable = case_when(
+      variable == "monthly_historical_avg" ~ "Monthly Historical Average",
+      variable == "county_avg_fires" ~ "County Average Fires",
+      variable == "roll_mean_tmax" ~ "Rolling Mean Max Temp",
+      variable == "roll_mean_prcp" ~ "Rolling Mean Precipitation",
+      variable == "tmax" ~ "Maximum Temperature",
+      variable == "tmin" ~ "Minimum Temperature", 
+      variable == "total_prcp" ~ "Total Precipitation",
+      variable == "THE_COUNTY" ~ "County",
+      TRUE ~ variable
+    ),
+    importance_pct = (importance/max(importance)) * 100
+  ) %>%
+  arrange(importance_pct)
+
+ggplot(rf_importance_plot, 
+       aes(x = reorder(variable, importance_pct), 
+           y = importance_pct)) +
+  geom_bar(stat = "identity", 
+           fill = "#9DB5B2", 
+           alpha = 0.8) +
+  coord_flip() +  
+  theme_minimal() +
+  labs(
+    title = "Feature Importance in Global Fire Prediction Model",
+    subtitle = "Relative importance of features in predicting next month's fire activity",
+    x = NULL,  
+    y = "Relative Importance (%)"
+  ) +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(size = 10, color = "grey40"),
+    axis.text = element_text(size = 10),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+
+ggsave("rf_feature_importance.png", 
+       width = 10, 
+       height = 6, 
+       dpi = 300)
+
+```
+
+
+
+**GRADIENT BOOSTING MODEL (GBM)**
+FOR MODEL COMPARISON & CONSISTENCY: Keeping same feature set as the logistic regression, removing insignificant variables ( prev_month_burned, MONTH, and county_risk_level)
+
+```{r}
+merged_county_fires_weather <- merged_county_fires_weather %>%
+  group_by(THE_COUNTY) %>%
+  arrange(YEAR, MONTH) %>%
+  mutate(
+    log_acres = log(total_acres_burned + 1),
+    log_next_month_acres = log(next_month_acres + 1),
+    
+    roll_mean_prcp = (total_prcp + lag(total_prcp, 1) + lag(total_prcp, 2))/3,
+    roll_mean_tmax = (tmax + lag(tmax, 1) + lag(tmax, 2))/3,
+    
+    county_avg_fires = mean(log_acres, na.rm = TRUE),
+    monthly_historical_avg = ave(log_acres, MONTH, FUN = mean),
+    
+    fire_next_month = as.factor(if_else(log_next_month_acres > 
+      median(log_acres, na.rm = TRUE), "yes", "no"))
+  ) %>%
+  ungroup()
+
+train_county_gbm <- function(county_data, split_year) {
+  train_data <- county_data %>% 
+    filter(YEAR <= split_year) %>%
+    select(fire_next_month, total_prcp, tmax, tmin, 
+           roll_mean_prcp, roll_mean_tmax,
+           county_avg_fires, monthly_historical_avg) %>%
+    na.omit()
+  
+  test_data <- county_data %>%
+    filter(YEAR > split_year) %>%
+    select(fire_next_month, total_prcp, tmax, tmin,
+           roll_mean_prcp, roll_mean_tmax,
+           county_avg_fires, monthly_historical_avg) %>%
+    na.omit()
+  
+  if(nrow(train_data) < 30 || nrow(test_data) < 10) {
+    return(NULL)
+  }
+  
+  unique_classes_train <- unique(train_data$fire_next_month)
+  
+  train_matrix <- model.matrix(~ . - 1, data = train_data %>% select(-fire_next_month))
+  test_matrix <- model.matrix(~ . - 1, data = test_data %>% select(-fire_next_month))
+  
+  dtrain <- xgb.DMatrix(train_matrix, 
+                        label = as.numeric(train_data$fire_next_month) - 1)
+  dtest <- xgb.DMatrix(test_matrix, 
+                       label = as.numeric(test_data$fire_next_month) - 1)
+  
+  params <- list(
+    objective = "binary:logistic",
+    eval_metric = "logloss",
+    eta = 0.1,
+    max_depth = 6,
+    min_child_weight = 1,
+    subsample = 0.8,
+    colsample_bytree = 0.8
+  )
+  
+  set.seed(123)
+  gbm <- xgb.train(
+    params = params,
+    data = dtrain,
+    nrounds = 100,
+    verbose = 0
+  )
+  
+  predictions <- as.factor(ifelse(predict(gbm, dtest) > 0.5, "yes", "no"))
+  prob_predictions <- predict(gbm, dtest)
+  
+  conf_matrix <- table(Predicted = predictions, Actual = test_data$fire_next_month)
+  
+  metrics <- list(
+    accuracy = sum(diag(conf_matrix))/sum(conf_matrix),
+    precision = conf_matrix["yes","yes"]/sum(conf_matrix["yes",]),
+    recall = conf_matrix["yes","yes"]/sum(conf_matrix[,"yes"]),
+    auc = auc(roc(test_data$fire_next_month, prob_predictions))
+  )
+  
+  results <- data.frame(
+    actual = test_data$fire_next_month,
+    predicted = predictions,
+    predicted_prob = prob_predictions,
+    year = county_data$YEAR[county_data$YEAR > split_year][1:length(predictions)],
+    month = county_data$MONTH[county_data$YEAR > split_year][1:length(predictions)]
+  )
+  
+  return(list(
+    model = gbm,
+    metrics = metrics,
+    importance = xgb.importance(model = gbm),
+    predictions = results,
+    single_class = FALSE
+  ))
+}
+
+split_year <- quantile(unique(merged_county_fires_weather$YEAR), 0.8)
+
+global_train_data <- merged_county_fires_weather %>% 
+  filter(YEAR <= split_year) %>% 
+  select(fire_next_month, total_prcp, tmax, tmin, THE_COUNTY, 
+         roll_mean_prcp, roll_mean_tmax,
+         county_avg_fires, monthly_historical_avg) %>%
+  na.omit()
+
+global_test_data <- merged_county_fires_weather %>% 
+  filter(YEAR > split_year) %>%
+  select(fire_next_month, total_prcp, tmax, tmin, THE_COUNTY, 
+          roll_mean_prcp, roll_mean_tmax,
+         county_avg_fires, monthly_historical_avg) %>%
+  na.omit()
+
+global_train_matrix <- model.matrix(~ . - 1, 
+                                  data = global_train_data %>% select(-fire_next_month))
+global_test_matrix <- model.matrix(~ . - 1, 
+                                 data = global_test_data %>% select(-fire_next_month))
+
+dtrain <- xgb.DMatrix(global_train_matrix, 
+                      label = as.numeric(global_train_data$fire_next_month) - 1)
+dtest <- xgb.DMatrix(global_test_matrix, 
+                     label = as.numeric(global_test_data$fire_next_month) - 1)
+
+set.seed(123)
+global_gbm <- xgb.train(
+  params = list(
+    objective = "binary:logistic",
+    eval_metric = "logloss",
+    eta = 0.1,
+    max_depth = 6,
+    min_child_weight = 1,
+    subsample = 0.8,
+    colsample_bytree = 0.8
+  ),
+  data = dtrain,
+  nrounds = 100,
+  verbose = 0
+)
+
+county_models <- merged_county_fires_weather %>%
+  group_by(THE_COUNTY) %>%
+  group_split() %>%
+  setNames(unique(merged_county_fires_weather$THE_COUNTY)) %>%
+  purrr::map(~train_county_gbm(.x, split_year))
+
+gb_county_results <- data.frame(
+  county = names(county_models)[!sapply(county_models, is.null)],
+  accuracy = map_dbl(county_models[!sapply(county_models, is.null)], ~.x$metrics$accuracy),
+  precision = map_dbl(county_models[!sapply(county_models, is.null)], ~.x$metrics$precision),
+  recall = map_dbl(county_models[!sapply(county_models, is.null)], ~.x$metrics$recall),
+  auc = map_dbl(county_models[!sapply(county_models, is.null)], ~.x$metrics$auc)
+)
+
+
+global_predictions_gb <- as.factor(ifelse(predict(global_gbm, dtest) > 0.5, "yes", "no"))
+global_prob_predictions_gb <- predict(global_gbm, dtest)
+global_conf_matrix_gb <- table(Predicted = global_predictions_gb, 
+                          Actual = global_test_data$fire_next_month)
+
+global_metrics <- list(
+  accuracy = sum(diag(global_conf_matrix))/sum(global_conf_matrix),
+  precision = global_conf_matrix["yes","yes"]/sum(global_conf_matrix["yes",]),
+  recall = global_conf_matrix["yes","yes"]/sum(global_conf_matrix[,"yes"])
+)
+
+global_metrics$f1 <- 2 * (global_metrics$precision * global_metrics$recall) / 
+                        (global_metrics$precision + global_metrics$recall)
+global_metrics$auc <- auc(roc(global_test_data$fire_next_month, global_prob_predictions_gb))
+
+print("Global Model Results:")
+print("Confusion Matrix:")
+print(global_conf_matrix)
+print(paste("Accuracy:", round(global_metrics$accuracy, 3)))
+print(paste("Precision:", round(global_metrics$precision, 3)))
+print(paste("Recall:", round(global_metrics$recall, 3)))
+print(paste("F1 Score:", round(global_metrics$f1, 3)))
+print(paste("AUC:", round(global_metrics$auc, 3)))
+
+print("\nCounty-level Performance Summary:")
+print(gb_county_results %>% 
+        arrange(-accuracy) %>%
+        mutate(across(where(is.numeric), ~round(., 3))) %>%
+        select(county, everything()))
+
+importance_matrix <- xgb.importance(model = global_gbm)
+print("\nGlobal Model Variable Importance:")
+print(importance_matrix)
+
+ggplot(gb_county_results, aes(x = reorder(county, accuracy), y = accuracy)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  labs(title = "GBM Model Accuracy by County",
+       x = "County",
+       y = "Accuracy") +
+  theme_minimal()
+
+gb_roc_obj <- roc(global_test_data$fire_next_month, global_prob_predictions_gb)
+plot(gb_roc_obj, main = "ROC Curve - GBM Global Model")
+
+
+## PLOTTING
+
+gbm_importance_plot <- importance_matrix %>%
+  mutate(
+    is_county = grepl("THE_COUNTY", Feature),
+    Feature = case_when(
+      is_county ~ "County",
+      Feature == "monthly_historical_avg" ~ "Monthly Historical Average",
+      Feature == "county_avg_fires" ~ "County Average Fires",
+      Feature == "roll_mean_tmax" ~ "Rolling Mean Max Temp",
+      Feature == "roll_mean_prcp" ~ "Rolling Mean Precipitation",
+      Feature == "tmax" ~ "Maximum Temperature",
+      Feature == "tmin" ~ "Minimum Temperature",
+      Feature == "total_prcp" ~ "Total Precipitation",
+      TRUE ~ Feature
+    )
+  ) %>%
+  group_by(Feature) %>%
+  summarise(
+    total_gain = sum(Gain)
+  ) %>%
+  mutate(
+    importance_pct = (total_gain/max(total_gain)) * 100
+  ) %>%
+  arrange(importance_pct)
+
+ggplot(gbm_importance_plot, 
+       aes(x = reorder(Feature, importance_pct), 
+           y = importance_pct)) +
+  geom_bar(stat = "identity", 
+           fill = "#9DB5B2",
+           alpha = 0.8) +
+  coord_flip() +  
+  theme_minimal() +
+  labs(
+    title = "Feature Importance in Global Fire Prediction Model",
+    subtitle = "Relative importance of features in predicting next month's fire activity",
+    x = NULL,  
+    y = "Relative Importance (%)"
+  ) +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(size = 10, color = "grey40"),
+    axis.text = element_text(size = 10),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+
+ggsave("gbm_feature_importance.png", 
+       width = 10, 
+       height = 6, 
+       dpi = 300)
+
+
+```
+
+fixed now, can ignore below code block: RF AND GBM COMPARISON AS ORIGINALLY GAVE SAME METRICS, BUT DIFF AUC SCORES AND TRYING TO UNDERSTAND / VISUALISE WHY THIS COULD BE HAPPENING:
+
+```{r}
+
+# rf_probabilities <- predict(global_rf, global_test_data, type = "prob")[,"yes"]
+# gbm_probabilities <- predict(global_gbm, dtest)
+# 
+# probability_comparison <- data.frame(
+#   RF = rf_probabilities,
+#   GBM = gbm_probabilities
+# )
+# 
+# ggplot() +
+#   geom_density(data = data.frame(prob = rf_probabilities, model = "RF"), 
+#                aes(x = prob, fill = "Random Forest"), alpha = 0.5) +
+#   geom_density(data = data.frame(prob = gbm_probabilities, model = "GBM"), 
+#                aes(x = prob, fill = "GBM"), alpha = 0.5) +
+#   scale_fill_manual(values = c("Random Forest" = "#8884d8", "GBM" = "#82ca9d")) +
+#   labs(title = "Probability Distribution Comparison",
+#        x = "Predicted Probability",
+#        y = "Density",
+#        fill = "Model") +
+#   theme_minimal() +
+#   theme(
+#     plot.title = element_text(face = "bold", size = 14),
+#     legend.position = "bottom"
+#   )
+# ggsave("probability_distributions.png", width = 10, height = 6, dpi = 300)
+# 
+# cat("\nProbability Distribution Summary:\n")
+# cat("\nRandom Forest:\n")
+# print(summary(rf_probabilities))
+# cat("\nGBM:\n")
+# print(summary(gbm_probabilities))
+# 
+# correlation <- cor(rf_probabilities, gbm_probabilities)
+# cat("\nCorrelation between RF and GBM probabilities:", round(correlation, 3), "\n")
+# 
+# rf_predictions <- ifelse(rf_probabilities > 0.5, "yes", "no")
+# gbm_predictions <- ifelse(gbm_probabilities > 0.5, "yes", "no")
+# agreement_table <- table(RF = rf_predictions, GBM = gbm_predictions)
+# cat("\nModel Agreement Table:\n")
+# print(agreement_table)
+# 
+# agreement_percentage <- sum(diag(agreement_table)) / sum(agreement_table) * 100
+# cat("\nPercentage of identical predictions:", round(agreement_percentage, 2), "%\n")
+# 
+# disagreement_analysis <- data.frame(
+#   RF_prob = rf_probabilities,
+#   GBM_prob = gbm_probabilities,
+#   RF_pred = rf_predictions,
+#   GBM_pred = gbm_predictions,
+#   Prob_difference = abs(rf_probabilities - gbm_probabilities)
+# )
+# 
+# interesting_cases <- disagreement_analysis %>%
+#   filter(RF_pred == GBM_pred) %>%
+#   filter(Prob_difference > 0.2) %>%
+#   arrange(desc(Prob_difference))
+# 
+# cat("\nCases with large probability differences (>0.2) but same prediction:\n")
+# print(head(interesting_cases, 10))
+# 
+# print("Class distribution in training data:")
+# print(table(global_train_data$fire_next_month))
+# 
+# rf_importance <- importance(global_rf)
+# gbm_importance <- xgb.importance(model = global_gbm)
+# 
+# print("Top RF features:")
+# print(head(rf_importance))
+# print("Top GBM features:")
+# print(head(gbm_importance))
+```
+
+
+
+##### EXTRA COMPARISON CODE #######
+
+COMPARISON PLOT
+```{r}
+### CHOROPLETHs
+
+
+dt_county_results$model <- "Decision Tree"
+rf_county_results$model <- "Random Forest"
+gb_county_results$model <- "Gradient Boosting"
+clean_lr_county_results$model <- "Logistic Regression"
+
+combined_county_results <- bind_rows(dt_county_results, rf_county_results, gb_county_results, clean_lr_county_results) %>%
+  mutate(county = toupper(county))  # ensuring th county names match the shapefile
+
+# # reading in california counties shapefile
+ california_counties <- st_read("california_counties.geojson") %>%
+   st_transform(4326) %>%  # make into WGS84
+   mutate(NAME = toupper(NAME))
+
+library(dplyr)
+county_map_data <- california_counties %>%
+  left_join(combined_county_results, by = c("THE_COUNTY" = "county")) %>%
+  mutate(model = ifelse(is.na(model), "Random Forest", model))
+
+chloropleth_plot <- ggplot(data = county_map_data) +
+  geom_sf(aes(fill = recall)) +
+  scale_fill_gradientn(
+    colors = c("#FF0000", "#FFFF00", "#00FF00", "#0000FF", "#4B0082"),
+    name = "Recall Score",
+    na.value = "grey80",
+    limits = c(0, 1),
+    breaks = seq(0, 1, by = 0.25),
+    labels = scales::label_number(accuracy = 0.01)
+  ) +
+  facet_wrap(~ model) +
+  theme_minimal() +
+  labs(title = "County-Level Model Performance (Recall)",
+       subtitle = "Performance across Decision Tree, Random Forest, GBM, and Logistic Regression") +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5),
+        axis.text = element_blank(),
+        axis.ticks = element_blank())
+
+ggsave("chloropleth_map.png", 
+       plot = chloropleth_plot, 
+       width = 12, 
+       height = 8, 
+       dpi = 300)
+
+# ROC curves
+png("roc_curves_all.png", width = 800, height = 800)
+
+library(pROC)
+plot(dt_roc_obj, col = "blue", lwd = 2, main = "Global Model ROC Curves", legacy.axes = TRUE)
+plot(rf_roc_obj, col = "red", lwd = 2, add = TRUE)
+plot(gb_roc_obj, col = "green", lwd = 2, add = TRUE)
+plot(roc_obj_clean, col = "purple", lwd = 2, add = TRUE)
+legend("bottomright", 
+       legend = c("Decision Tree", "Random Forest", "GBM", "Logistic Regression"),
+       col = c("blue", "red", "green", "purple"), 
+       lwd = 2)
+
+dev.off()
+
+## SAVE TO PNGS 
+```
+
+OPTIMISATION 
+
+**SIMPLY COUNTING THE FALSE NEGATIVE RATE BUT CAN BE ADAPTED BY MODEL PERFORMANCe - not relevant for our essay discussion just own exploration**
+```{r}
+if (!"next_month_acres" %in% names(merged_county_fires_weather)) {
+  set.seed(123)
+  merged_county_fires_weather <- merged_county_fires_weather %>%
+    mutate(next_month_acres = round(runif(n(), min = 0, max = 200000)))
+}
+
+merged_county_fires_weather <- merged_county_fires_weather %>%
+  group_by(THE_COUNTY) %>%
+  arrange(YEAR, MONTH) %>%
+  mutate(
+    next_month_acres_orig = next_month_acres,
+    
+    log_acres = log(total_acres_burned + 1),
+    log_next_month_acres = log(next_month_acres + 1),
+    
+    prev_month_burned = lag(total_acres_burned, 1),
+    roll_mean_prcp = (total_prcp + lag(total_prcp, 1) + lag(total_prcp, 2)) / 3,
+    roll_mean_tmax = (tmax + lag(tmax, 1) + lag(tmax, 2)) / 3,
+    
+    county_risk_level = ntile(mean(log_acres, na.rm = TRUE), 4),
+    monthly_historical_avg = ave(log_acres, MONTH, FUN = mean),
+    county_avg_fires = mean(log_acres, na.rm = TRUE),
+    
+    fire_next_month = as.factor(if_else(log_next_month_acres > median(log_acres, na.rm = TRUE), "yes", "no"))
+  ) %>%
+  ungroup()
+
+if (!exists("split_year")) {
+  split_year <- quantile(unique(merged_county_fires_weather$YEAR), 0.8)
+}
+
+global_test_data <- merged_county_fires_weather %>% 
+  filter(YEAR > split_year) %>% 
+  select(fire_next_month, total_prcp, tmax, tmin, THE_COUNTY, 
+         MONTH, roll_mean_prcp, roll_mean_tmax, prev_month_burned,
+         county_avg_fires, county_risk_level, monthly_historical_avg, next_month_acres_orig) %>%
+  na.omit()
+
+weighted_FN_penalty <- function(actual, predicted, fire_size, threshold = 100000, alpha = 10) {
+  # actual and predicted are factors with levels "no" and "yes"
+
+  
+  is_FN <- (actual == "yes" & predicted == "no")
+  weights <- ifelse(fire_size > threshold, alpha, 1)
+  penalty <- sum(is_FN * weights)
+  return(penalty)
+}
+
+set.seed(123)
+n_test <- nrow(global_test_data)
+
+# dummy predictions
+global_prob_predictions_lr <- factor(sample(c("no", "yes"), n_test, replace = TRUE, prob = c(0.7, 0.3)), levels = c("no", "yes"))
+dt_global_predictions         <- factor(sample(c("no", "yes"), n_test, replace = TRUE, prob = c(0.65, 0.35)), levels = c("no", "yes"))
+global_prob_predictions_rf    <- factor(sample(c("no", "yes"), n_test, replace = TRUE, prob = c(0.6, 0.4)), levels = c("no", "yes"))
+global_prob_predictions_gb    <- factor(sample(c("no", "yes"), n_test, replace = TRUE, prob = c(0.68, 0.32)), levels = c("no", "yes"))
+
+big_fire_threshold <- 100000  # threshold for a "big" fire
+alpha_penalty      <- 10       # penalty multiplier for false negatives on big fires
+
+lr_FN_penalty <- weighted_FN_penalty(
+  actual = global_test_data$fire_next_month, 
+  predicted = global_prob_predictions_lr, 
+  fire_size = global_test_data$next_month_acres_orig, 
+  threshold = big_fire_threshold, 
+  alpha = alpha_penalty
+)
+
+dt_FN_penalty <- weighted_FN_penalty(
+  actual = global_test_data$fire_next_month, 
+  predicted = dt_global_predictions, 
+  fire_size = global_test_data$next_month_acres_orig, 
+  threshold = big_fire_threshold, 
+  alpha = alpha_penalty
+)
+
+rf_FN_penalty <- weighted_FN_penalty(
+  actual = global_test_data$fire_next_month, 
+  predicted = global_prob_predictions_rf, 
+  fire_size = global_test_data$next_month_acres_orig, 
+  threshold = big_fire_threshold, 
+  alpha = alpha_penalty
+)
+
+gbm_FN_penalty <- weighted_FN_penalty(
+  actual = global_test_data$fire_next_month, 
+  predicted = global_prob_predictions_gb, 
+  fire_size = global_test_data$next_month_acres_orig, 
+  threshold = big_fire_threshold, 
+  alpha = alpha_penalty
+)
+
+penalty_comparison <- data.frame(
+  Model = c("Logistic Regression", "Decision Tree", "Random Forest", "GBM"),
+  Weighted_FN_Penalty = c(lr_FN_penalty, dt_FN_penalty, rf_FN_penalty, gbm_FN_penalty)
+)
+
+print("Weighted False Negative Penalty Comparison:")
+print(penalty_comparison)
+
+```
+
+**EXTRA DECISION TREE WITH CUT-OFF ALPHA**
+```{r}
+# compute predicted probabilities for the training
+dt_global_train$predicted_prob <- predict(dt_global_model, 
+                                          newdata = dt_global_train, 
+                                          type = "prob")[, "yes"]
+
+#### this bit can be edited by fire management agencies ######## 
+# - If we predict "no" but the actual is "yes" (i.e. miss a large fire): cost = -100
+# - If we predict "yes" but the actual is "no" (i.e. false alarm): cost = -1
+# - Correct predictions: 0 cost
+CB_fire <- matrix(c(10, -100,   # row for no
+                    -5,  1),   # row for prediction yes
+                  nrow = 2, byrow = TRUE)
+
+alpha_seq <- seq(0.01, 0.99, 0.01)
+
+expectedCost <- numeric(length(alpha_seq))
+
+for (i in seq_along(alpha_seq)) {
+  predLab <- ifelse(dt_global_train$predicted_prob >= alpha_seq[i], "yes", "no")
+  
+  confusion <- table(factor(predLab, levels = c("no", "yes")),
+                     factor(dt_global_train$fire_next_month, levels = c("no", "yes")))
+  
+  expectedCost[i] <- sum(CB_fire * as.matrix(confusion)) / sum(confusion)
+}
+
+optimal_alpha <- alpha_seq[which.max(expectedCost)]
+
+cat("Optimal Cut-off Threshold (α):", optimal_alpha, "\n")
+cat("Expected Average Cost at Optimal α:", max(expectedCost), "\n")
+
+plot(alpha_seq, expectedCost, type = "l", col = "blue", lwd = 2,
+     xlab = "Cut-off Probability (Alpha)",
+     ylab = "Expected Average Cost",
+     main = "Expected Cost vs. Cut-off Threshold (Training Data)")
+
+#  Performance on test,
+
+dt_global_test$predicted_prob <- predict(dt_global_model, 
+                                         newdata = dt_global_test, 
+                                         type = "prob")[, "yes"]
+
+pred_05 <- ifelse(dt_global_test$predicted_prob >= 0.5, "yes", "no")
+pred_optimal <- ifelse(dt_global_test$predicted_prob >= optimal_alpha, "yes", "no")
+
+conf_05 <- table(Predicted = pred_05, Actual = dt_global_test$fire_next_month)
+conf_optimal <- table(Predicted = pred_optimal, Actual = dt_global_test$fire_next_month)
+
+cat("\nConfusion Matrix (Threshold = 0.5):\n")
+print(conf_05)
+
+cat("\nConfusion Matrix (Optimal Threshold):\n")
+print(conf_optimal)
+
+
+# ensuring the confusion matrix has all four cels 
+cm <- conf_optimal
+if(!("no" %in% rownames(cm))) {
+  cm <- rbind("no" = c(no = 0, yes = 0), cm)
+}
+if(!("yes" %in% rownames(cm))) {
+  cm <- rbind(cm, "yes" = c(no = 0, yes = 0))
+}
+if(!("no" %in% colnames(cm))) {
+  cm <- cbind(cm, no = c(0,0))
+}
+if(!("yes" %in% colnames(cm))) {
+  cm <- cbind(cm, yes = c(0,0))
+}
+TN <- cm["no", "no"]
+FN <- cm["no", "yes"]
+FP <- cm["yes", "no"]
+TP <- cm["yes", "yes"]
+
+accuracy <- (TP + TN) / (TP + TN + FP + FN)
+precision <- if ((TP + FP) > 0) TP / (TP + FP) else NA
+recall <- if ((TP + FN) > 0) TP / (TP + FN) else NA
+F1 <- if (!is.na(precision) && !is.na(recall) && (precision + recall) > 0) 2 * (precision * recall) / (precision + recall) else NA
+
+cat("\nPerformance Metrics (Optimal Threshold):\n")
+cat("Accuracy:", round(accuracy, 3), "\n")
+cat("Precision:", round(precision, 3), "\n")
+cat("Recall:", round(recall, 3), "\n")
+cat("F1 Score:", round(F1, 3), "\n")
+
+# AUC 
+roc_obj <- roc(dt_global_test$fire_next_month, dt_global_test$predicted_prob, levels = c("no", "yes"))
+auc_value <- auc(roc_obj)
+cat("AUC:", round(auc_value, 3), "\n")
+
+# ROC curve
+
+plot(roc_obj, col = "red", lwd = 2, main = "ROC Curve for Global Fire Prediction Model",
+     xlab = "1 - Specificity (False Positive Rate)", ylab = "Sensitivity (True Positive Rate)")
+legend("bottomright", legend = paste("AUC =", round(auc_value, 3)), col = "red", lwd = 2)
+
+```
+
+
+**Optimisation for GBM for section 4.4**
+```{r}
+# GRADIENT BOOSTING MODEL
+# With EXTRA COST-BASED THRESHOLD OPTIMISATION 
+
+library(dplyr)
+library(xgboost)
+library(pROC)
+library(ggplot2)
+library(purrr)
+library(forcats)
+
+
+merged_county_fires_weather <- merged_county_fires_weather %>%
+  group_by(THE_COUNTY) %>%
+  arrange(YEAR, MONTH) %>%
+  mutate(
+    log_acres = log(total_acres_burned + 1),
+    log_next_month_acres = log(next_month_acres + 1),
+    
+    roll_mean_prcp = (total_prcp + lag(total_prcp, 1) + lag(total_prcp, 2)) / 3,
+    roll_mean_tmax = (tmax + lag(tmax, 1) + lag(tmax, 2)) / 3,
+    
+    county_avg_fires = mean(log_acres, na.rm = TRUE),
+    monthly_historical_avg = ave(log_acres, MONTH, FUN = mean),
+    
+    fire_next_month = as.factor(if_else(log_next_month_acres > median(log_acres, na.rm = TRUE), "yes", "no"))
+  ) %>%
+  ungroup()
+
+train_county_gbm <- function(county_data, split_year) {
+  train_data <- county_data %>% 
+    filter(YEAR <= split_year) %>%
+    select(fire_next_month, total_prcp, tmax, tmin, 
+           roll_mean_prcp, roll_mean_tmax,
+           county_avg_fires, monthly_historical_avg) %>%
+    na.omit()
+  
+  test_data <- county_data %>%
+    filter(YEAR > split_year) %>%
+    select(fire_next_month, total_prcp, tmax, tmin,
+           roll_mean_prcp, roll_mean_tmax,
+           county_avg_fires, monthly_historical_avg) %>%
+    na.omit()
+  
+  if(nrow(train_data) < 30 || nrow(test_data) < 10) {
+    return(NULL)
+  }
+  
+  unique_classes_train <- unique(train_data$fire_next_month)
+  
+  train_matrix <- model.matrix(~ . - 1, data = train_data %>% select(-fire_next_month))
+  test_matrix <- model.matrix(~ . - 1, data = test_data %>% select(-fire_next_month))
+  
+  dtrain <- xgb.DMatrix(train_matrix, 
+                        label = as.numeric(train_data$fire_next_month) - 1)
+  dtest <- xgb.DMatrix(test_matrix, 
+                       label = as.numeric(test_data$fire_next_month) - 1)
+  
+  params <- list(
+    objective = "binary:logistic",
+    eval_metric = "logloss",
+    eta = 0.1,
+    max_depth = 6,
+    min_child_weight = 1,
+    subsample = 0.8,
+    colsample_bytree = 0.8
+  )
+  
+  set.seed(123)
+  gbm <- xgb.train(
+    params = params,
+    data = dtrain,
+    nrounds = 100,
+    verbose = 0
+  )
+  
+  predictions <- as.factor(ifelse(predict(gbm, dtest) > 0.5, "yes", "no"))
+  prob_predictions <- predict(gbm, dtest)
+  
+  conf_matrix <- table(Predicted = predictions, Actual = test_data$fire_next_month)
+  
+  metrics <- list(
+    accuracy = sum(diag(conf_matrix)) / sum(conf_matrix),
+    precision = conf_matrix["yes", "yes"] / sum(conf_matrix["yes", ]),
+    recall = conf_matrix["yes", "yes"] / sum(conf_matrix[, "yes"]),
+    auc = auc(roc(test_data$fire_next_month, prob_predictions))
+  )
+  
+  results <- data.frame(
+    actual = test_data$fire_next_month,
+    predicted = predictions,
+    predicted_prob = prob_predictions,
+    year = county_data$YEAR[county_data$YEAR > split_year][1:length(predictions)],
+    month = county_data$MONTH[county_data$YEAR > split_year][1:length(predictions)]
+  )
+  
+  return(list(
+    model = gbm,
+    metrics = metrics,
+    importance = xgb.importance(model = gbm),
+    predictions = results,
+    single_class = FALSE
+  ))
+}
+
+split_year <- quantile(unique(merged_county_fires_weather$YEAR), 0.8)
+
+global_train_data <- merged_county_fires_weather %>% 
+  filter(YEAR <= split_year) %>% 
+  select(fire_next_month, total_prcp, tmax, tmin, THE_COUNTY, 
+         roll_mean_prcp, roll_mean_tmax,
+         county_avg_fires, monthly_historical_avg) %>%
+  na.omit()
+
+global_test_data <- merged_county_fires_weather %>% 
+  filter(YEAR > split_year) %>%
+  select(fire_next_month, total_prcp, tmax, tmin, THE_COUNTY, 
+         roll_mean_prcp, roll_mean_tmax,
+         county_avg_fires, monthly_historical_avg) %>%
+  na.omit()
+
+global_train_matrix <- model.matrix(~ . - 1, 
+                                    data = global_train_data %>% select(-fire_next_month))
+global_test_matrix <- model.matrix(~ . - 1, 
+                                   data = global_test_data %>% select(-fire_next_month))
+
+dtrain <- xgb.DMatrix(global_train_matrix, 
+                      label = as.numeric(global_train_data$fire_next_month) - 1)
+dtest <- xgb.DMatrix(global_test_matrix, 
+                     label = as.numeric(global_test_data$fire_next_month) - 1)
+
+set.seed(123)
+global_gbm <- xgb.train(
+  params = list(
+    objective = "binary:logistic",
+    eval_metric = "logloss",
+    eta = 0.1,
+    max_depth = 6,
+    min_child_weight = 1,
+    subsample = 0.8,
+    colsample_bytree = 0.8
+  ),
+  data = dtrain,
+  nrounds = 100,
+  verbose = 0
+)
+
+# EXTRA: OPTIMISATION OF CUTOFF ALPHA USING A COST FUNCTION
+
+
+global_train_data$predicted_prob <- predict(global_gbm, dtrain)
+
+
+CB_fire <- matrix(c(10, -100,   
+                    -5,    1),   
+                  nrow = 2, byrow = TRUE)
+
+
+alpha_seq <- seq(0.01, 0.99, 0.01)
+
+
+expectedCost <- numeric(length(alpha_seq))
+
+for (i in seq_along(alpha_seq)) {
+  # classify as "yes" if predicted probability >= current threshold, else "no"
+  predLab <- ifelse(global_train_data$predicted_prob >= alpha_seq[i], "yes", "no")
+  
+  # confusion matrix
+  confusion <- table(factor(predLab, levels = c("no", "yes")),
+                     factor(global_train_data$fire_next_month, levels = c("no", "yes")))
+  
+
+  expectedCost[i] <- sum(CB_fire * as.matrix(confusion)) / sum(confusion)
+}
+
+optimal_alpha <- alpha_seq[which.max(expectedCost)]
+cat("Optimal Cut-off Threshold (α):", optimal_alpha, "\n")
+cat("Expected Average Cost at Optimal α:", max(expectedCost), "\n")
+
+plot(alpha_seq, expectedCost, type = "l", col = "blue", lwd = 2,
+     xlab = "Cut-off Probability (Alpha)",
+     ylab = "Expected Average Cost",
+     main = "Expected Cost vs. Cut-off Threshold (Training Data)")
+
+# TEST PERFORMANCE w THE OPTIMAL THRESHOLD
+
+#  predicted probabilities for the test set
+global_test_data$predicted_prob <- predict(global_gbm, dtest)
+
+pred_05 <- ifelse(global_test_data$predicted_prob >= 0.5, "yes", "no")
+pred_optimal <- ifelse(global_test_data$predicted_prob >= optimal_alpha, "yes", "no")
+
+# build confusion matrics for both cases:
+conf_05 <- table(Predicted = pred_05, Actual = global_test_data$fire_next_month)
+conf_optimal <- table(Predicted = pred_optimal, Actual = global_test_data$fire_next_month)
+
+cat("\nConfusion Matrix (Threshold = 0.5):\n")
+print(conf_05)
+
+cat("\nConfusion Matrix (Optimal Threshold):\n")
+print(conf_optimal)
+
+# ensuring the confusion matrix for optimal threshold has all cells
+cm_optimal <- conf_optimal
+if (!("no" %in% rownames(cm_optimal))) { 
+  cm_optimal <- rbind("no" = c(no = 0, yes = 0), cm_optimal) 
+}
+if (!("yes" %in% rownames(cm_optimal))) { 
+  cm_optimal <- rbind(cm_optimal, "yes" = c(no = 0, yes = 0)) 
+}
+if (!("no" %in% colnames(cm_optimal))) { 
+  cm_optimal <- cbind(cm_optimal, no = c(0, 0)) 
+}
+if (!("yes" %in% colnames(cm_optimal))) { 
+  cm_optimal <- cbind(cm_optimal, yes = c(0, 0)) 
+}
+TN_opt <- cm_optimal["no", "no"]
+FN_opt <- cm_optimal["no", "yes"]
+FP_opt <- cm_optimal["yes", "no"]
+TP_opt <- cm_optimal["yes", "yes"]
+
+optimal_accuracy <- (TP_opt + TN_opt) / (TP_opt + TN_opt + FP_opt + FN_opt)
+optimal_precision <- if ((TP_opt + FP_opt) > 0) TP_opt / (TP_opt + FP_opt) else NA
+optimal_recall <- if ((TP_opt + FN_opt) > 0) TP_opt / (TP_opt + FN_opt) else NA
+optimal_F1 <- if (!is.na(optimal_precision) && !is.na(optimal_recall) && (optimal_precision + optimal_recall) > 0) {
+  2 * (optimal_precision * optimal_recall) / (optimal_precision + optimal_recall)
+} else NA
+
+cat("\nPerformance Metrics (Optimal Threshold):\n")
+cat("Accuracy:", round(optimal_accuracy, 3), "\n")
+cat("Precision:", round(optimal_precision, 3), "\n")
+cat("Recall:", round(optimal_recall, 3), "\n")
+cat("F1 Score:", round(optimal_F1, 3), "\n")
+
+# AUC
+roc_obj <- roc(global_test_data$fire_next_month, global_test_data$predicted_prob, levels = c("no", "yes"))
+auc_value <- auc(roc_obj)
+cat("AUC:", round(auc_value, 3), "\n")
+
+
+# TEST PERFORMANCE USING THE DEFAULT THRESHOLD (0.5)
+
+# Ensuring the confusion matrix for default threshold has all cells
+cm_default <- conf_05
+if (!("no" %in% rownames(cm_default))) { 
+  cm_default <- rbind("no" = c(no = 0, yes = 0), cm_default) 
+}
+if (!("yes" %in% rownames(cm_default))) { 
+  cm_default <- rbind(cm_default, "yes" = c(no = 0, yes = 0)) 
+}
+if (!("no" %in% colnames(cm_default))) { 
+  cm_default <- cbind(cm_default, no = c(0, 0)) 
+}
+if (!("yes" %in% colnames(cm_default))) { 
+  cm_default <- cbind(cm_default, yes = c(0, 0)) 
+}
+TN_def <- cm_default["no", "no"]
+FN_def <- cm_default["no", "yes"]
+FP_def <- cm_default["yes", "no"]
+TP_def <- cm_default["yes", "yes"]
+
+default_accuracy <- (TP_def + TN_def) / (TP_def + TN_def + FP_def + FN_def)
+default_precision <- if ((TP_def + FP_def) > 0) TP_def / (TP_def + FP_def) else NA
+default_recall <- if ((TP_def + FN_def) > 0) TP_def / (TP_def + FN_def) else NA
+default_F1 <- if (!is.na(default_precision) && !is.na(default_recall) && (default_precision + default_recall) > 0) {
+  2 * (default_precision * default_recall) / (default_precision + default_recall)
+} else NA
+
+cat("\nPerformance Metrics (Default Threshold = 0.5):\n")
+cat("Accuracy:", round(default_accuracy, 3), "\n")
+cat("Precision:", round(default_precision, 3), "\n")
+cat("Recall:", round(default_recall, 3), "\n")
+cat("F1 Score:", round(default_F1, 3), "\n")
+cat("AUC:", round(auc_value, 3), "\n")
+
+# ROC curve
+plot(roc_obj, col = "red", lwd = 2,
+     main = "ROC Curve for Global GBM Fire Prediction Model",
+     xlab = "1 - Specificity (False Positive Rate)", ylab = "Sensitivity (True Positive Rate)")
+legend("bottomright", legend = paste("AUC =", round(auc_value, 3)), col = "red", lwd = 2)
+
+
+```
+
+```{r}
+#GRADIENT BOOSTING MODEL (GBM)
+# With EXTRA COST-BASED THRESHOLD OPTIMISATION (Cut-Off Alpha)
+# Two Classifications:
+#   1. Median-based ("large fire")
+#   2. 95th Percentile-based ("really large fire")
+
+merged_county_fires_weather <- merged_county_fires_weather %>%
+  group_by(THE_COUNTY) %>%
+  arrange(YEAR, MONTH) %>%
+  mutate(
+    log_acres = log(total_acres_burned + 1),
+    log_next_month_acres = log(next_month_acres + 1),
+    
+    roll_mean_prcp = (total_prcp + lag(total_prcp, 1) + lag(total_prcp, 2)) / 3,
+    roll_mean_tmax = (tmax + lag(tmax, 1) + lag(tmax, 2)) / 3,
+    
+    county_avg_fires = mean(log_acres, na.rm = TRUE),
+    monthly_historical_avg = ave(log_acres, MONTH, FUN = mean),
+    
+    fire_next_month = as.factor(if_else(log_next_month_acres > median(log_acres, na.rm = TRUE), "yes", "no"))
+  ) %>%
+  ungroup()
+
+# for the "really large fire" classification we define a new target.
+merged_county_fires_weather <- merged_county_fires_weather %>%
+  mutate(
+    fire_next_month_big = as.factor(if_else(next_month_acres > 1229.108, "yes", "no"))
+  )
+
+train_county_gbm <- function(county_data, split_year, target_col) {
+ 
+  
+  train_data <- county_data %>% 
+    filter(YEAR <= split_year) %>%
+    select(!!sym(target_col), total_prcp, tmax, tmin, 
+           roll_mean_prcp, roll_mean_tmax, county_avg_fires, monthly_historical_avg) %>%
+    na.omit()
+  
+  test_data <- county_data %>%
+    filter(YEAR > split_year) %>%
+    select(!!sym(target_col), total_prcp, tmax, tmin,
+           roll_mean_prcp, roll_mean_tmax, county_avg_fires, monthly_historical_avg) %>%
+    na.omit()
+  
+  if(nrow(train_data) < 30 || nrow(test_data) < 10 ||
+     length(unique(train_data[[target_col]])) < 2) {
+    return(NULL)
+  }
+  
+  # prepare data for xgboost
+  train_matrix <- model.matrix(~ . - 1, data = train_data %>% select(-!!sym(target_col)))
+  test_matrix  <- model.matrix(~ . - 1, data = test_data %>% select(-!!sym(target_col)))
+  
+  dtrain <- xgb.DMatrix(train_matrix, label = as.numeric(train_data[[target_col]]) - 1)
+  dtest  <- xgb.DMatrix(test_matrix, label = as.numeric(test_data[[target_col]]) - 1)
+  
+  params <- list(
+    objective = "binary:logistic",
+    eval_metric = "logloss",
+    eta = 0.1,
+    max_depth = 6,
+    min_child_weight = 1,
+    subsample = 0.8,
+    colsample_bytree = 0.8
+  )
+  
+  set.seed(123)
+  gbm <- xgb.train(
+    params = params,
+    data = dtrain,
+    nrounds = 100,
+    verbose = 0
+  )
+  
+  predictions <- as.factor(ifelse(predict(gbm, dtest) > 0.5, "yes", "no"))
+  prob_predictions <- predict(gbm, dtest)
+  
+  conf_matrix <- table(Predicted = predictions, Actual = test_data[[target_col]])
+  metrics <- list(
+    accuracy = sum(diag(conf_matrix)) / sum(conf_matrix),
+    precision = conf_matrix["yes", "yes"] / sum(conf_matrix["yes", ]),
+    recall = conf_matrix["yes", "yes"] / sum(conf_matrix[, "yes"]),
+    auc = auc(roc(test_data[[target_col]], prob_predictions))
+  )
+  
+  results <- data.frame(
+    actual = test_data[[target_col]],
+    predicted = predictions,
+    predicted_prob = prob_predictions,
+    year = county_data$YEAR[county_data$YEAR > split_year][1:length(predictions)],
+    month = county_data$MONTH[county_data$YEAR > split_year][1:length(predictions)]
+  )
+  
+  return(list(
+    model = gbm,
+    metrics = metrics,
+    importance = xgb.importance(model = gbm),
+    predictions = results,
+    single_class = FALSE
+  ))
+}
+
+split_year <- quantile(unique(merged_county_fires_weather$YEAR), 0.8)
+
+global_train_data <- merged_county_fires_weather %>% 
+  filter(YEAR <= split_year) %>% 
+  select(fire_next_month, total_prcp, tmax, tmin, THE_COUNTY, 
+         roll_mean_prcp, roll_mean_tmax, county_avg_fires, monthly_historical_avg) %>%
+  na.omit()
+global_test_data <- merged_county_fires_weather %>% 
+  filter(YEAR > split_year) %>% 
+  select(fire_next_month, total_prcp, tmax, tmin, THE_COUNTY, 
+         roll_mean_prcp, roll_mean_tmax, county_avg_fires, monthly_historical_avg) %>%
+  na.omit()
+
+global_train_matrix <- model.matrix(~ . - 1, data = global_train_data %>% select(-fire_next_month))
+global_test_matrix  <- model.matrix(~ . - 1, data = global_test_data %>% select(-fire_next_month))
+
+dtrain <- xgb.DMatrix(global_train_matrix, label = as.numeric(global_train_data$fire_next_month) - 1)
+dtest  <- xgb.DMatrix(global_test_matrix, label = as.numeric(global_test_data$fire_next_month) - 1)
+
+set.seed(123)
+global_gbm <- xgb.train(
+  params = list(
+    objective = "binary:logistic",
+    eval_metric = "logloss",
+    eta = 0.1,
+    max_depth = 6,
+    min_child_weight = 1,
+    subsample = 0.8,
+    colsample_bytree = 0.8
+  ),
+  data = dtrain,
+  nrounds = 100,
+  verbose = 0
+)
+
+# for the 95th percentile ("really large fire") model:
+global_train_data_big <- merged_county_fires_weather %>% 
+  filter(YEAR <= split_year) %>% 
+  select(fire_next_month_big, total_prcp, tmax, tmin, THE_COUNTY, 
+         roll_mean_prcp, roll_mean_tmax, county_avg_fires, monthly_historical_avg, next_month_acres) %>%
+  na.omit()
+global_test_data_big <- merged_county_fires_weather %>% 
+  filter(YEAR > split_year) %>% 
+  select(fire_next_month_big, total_prcp, tmax, tmin, THE_COUNTY, 
+         roll_mean_prcp, roll_mean_tmax, county_avg_fires, monthly_historical_avg, next_month_acres) %>%
+  na.omit()
+
+global_train_matrix_big <- model.matrix(~ . - 1, data = global_train_data_big %>% select(-fire_next_month_big, -next_month_acres))
+global_test_matrix_big  <- model.matrix(~ . - 1, data = global_test_data_big %>% select(-fire_next_month_big, -next_month_acres))
+
+dtrain_big <- xgb.DMatrix(global_train_matrix_big, label = as.numeric(global_train_data_big$fire_next_month_big) - 1)
+dtest_big  <- xgb.DMatrix(global_test_matrix_big, label = as.numeric(global_test_data_big$fire_next_month_big) - 1)
+
+set.seed(123)
+global_gbm_big <- xgb.train(
+  params = list(
+    objective = "binary:logistic",
+    eval_metric = "logloss",
+    eta = 0.1,
+    max_depth = 6,
+    min_child_weight = 1,
+    subsample = 0.8,
+    colsample_bytree = 0.8
+  ),
+  data = dtrain_big,
+  nrounds = 100,
+  verbose = 0
+)
+
+
+# for the median-based model, use our current cost matrix.
+global_train_data$predicted_prob <- predict(global_gbm, dtrain)
+CB_fire <- matrix(c(10, -100, -5, 1), nrow = 2, byrow = TRUE)  
+alpha_seq <- seq(0.01, 0.99, 0.01)
+expectedCost <- numeric(length(alpha_seq))
+for (i in seq_along(alpha_seq)) {
+  predLab <- ifelse(global_train_data$predicted_prob >= alpha_seq[i], "yes", "no")
+  confusion <- table(factor(predLab, levels = c("no", "yes")),
+                     factor(global_train_data$fire_next_month, levels = c("no", "yes")))
+  expectedCost[i] <- sum(CB_fire * as.matrix(confusion)) / sum(confusion)
+}
+optimal_alpha <- alpha_seq[which.max(expectedCost)]
+cat("Median-Based Model - Optimal Cut-off Threshold (α):", optimal_alpha, "\n")
+cat("Expected Average Cost at Optimal α:", max(expectedCost), "\n")
+plot(alpha_seq, expectedCost, type = "l", col = "blue", lwd = 2,
+     xlab = "Cut-off Probability (Alpha)",
+     ylab = "Expected Average Cost",
+     main = "Median-Based: Expected Cost vs. Threshold (Training Data)")
+
+# for the big fire model, we adapt the punishment.
+
+global_train_data_big$predicted_prob <- predict(global_gbm_big, dtrain_big)
+
+CB_fire_big <- matrix(c(10, -100, -5, 1), nrow = 2, byrow = TRUE)
+alpha_seq_big <- seq(0.01, 0.99, 0.01)
+expectedCost_big <- numeric(length(alpha_seq_big))
+for (i in seq_along(alpha_seq_big)) {
+  predLab_big <- ifelse(global_train_data_big$predicted_prob >= alpha_seq_big[i], "yes", "no")
+  confusion_big <- table(factor(predLab_big, levels = c("no", "yes")),
+                         factor(global_train_data_big$fire_next_month_big, levels = c("no", "yes")))
+  expectedCost_big[i] <- sum(CB_fire_big * as.matrix(confusion_big)) / sum(confusion_big)
+}
+optimal_alpha_big <- alpha_seq_big[which.max(expectedCost_big)]
+cat("Big Fire Model - Optimal Cut-off Threshold (α):", optimal_alpha_big, "\n")
+cat("Expected Average Cost at Optimal α:", max(expectedCost_big), "\n")
+plot(alpha_seq_big, expectedCost_big, type = "l", col = "blue", lwd = 2,
+     xlab = "Cut-off Probability (Alpha)",
+     ylab = "Expected Average Cost",
+     main = "Big Fire: Expected Cost vs. Threshold (Training Data)")
+
+
+# median-based model:
+global_test_data$predicted_prob <- predict(global_gbm, dtest)
+pred_05 <- ifelse(global_test_data$predicted_prob >= 0.5, "yes", "no")
+pred_optimal <- ifelse(global_test_data$predicted_prob >= optimal_alpha, "yes", "no")
+conf_05 <- table(Predicted = pred_05, Actual = global_test_data$fire_next_month)
+conf_optimal <- table(Predicted = pred_optimal, Actual = global_test_data$fire_next_month)
+cat("\nMedian-Based Model - Confusion Matrix (Threshold = 0.5):\n")
+print(conf_05)
+cat("\nMedian-Based Model - Confusion Matrix (Optimal Threshold):\n")
+print(conf_optimal)
+
+
+# big fire model:
+global_test_data_big$predicted_prob <- predict(global_gbm_big, dtest_big)
+pred_05_big <- ifelse(global_test_data_big$predicted_prob >= 0.5, "yes", "no")
+pred_optimal_big <- ifelse(global_test_data_big$predicted_prob >= optimal_alpha_big, "yes", "no")
+conf_05_big <- table(Predicted = pred_05_big, Actual = global_test_data_big$fire_next_month_big)
+conf_optimal_big <- table(Predicted = pred_optimal_big, Actual = global_test_data_big$fire_next_month_big)
+cat("\nBig Fire Model - Confusion Matrix (Threshold = 0.5):\n")
+print(conf_05_big)
+cat("\nBig Fire Model - Confusion Matrix (Optimal Threshold):\n")
+print(conf_optimal_big)
+cm_optimal_big <- conf_optimal_big
+if (!("no" %in% rownames(cm_optimal_big))) { 
+  cm_optimal_big <- rbind("no" = c(no = 0, yes = 0), cm_optimal_big) 
+}
+if (!("yes" %in% rownames(cm_optimal_big))) { 
+  cm_optimal_big <- rbind(cm_optimal_big, "yes" = c(no = 0, yes = 0)) 
+}
+if (!("no" %in% colnames(cm_optimal_big))) { 
+  cm_optimal_big <- cbind(cm_optimal_big, no = c(0, 0)) 
+}
+if (!("yes" %in% colnames(cm_optimal_big))) { 
+  cm_optimal_big <- cbind(cm_optimal_big, yes = c(0, 0)) 
+}
+TN_big <- cm_optimal_big["no", "no"]
+FN_big <- cm_optimal_big["no", "yes"]
+FP_big <- cm_optimal_big["yes", "no"]
+TP_big <- cm_optimal_big["yes", "yes"]
+
+optimal_accuracy_big <- (TP_big + TN_big) / (TP_big + TN_big + FP_big + FN_big)
+optimal_precision_big <- if ((TP_big + FP_big) > 0) TP_big / (TP_big + FP_big) else NA
+optimal_recall_big <- if ((TP_big + FN_big) > 0) TP_big / (TP_big + FN_big) else NA
+optimal_F1_big <- if (!is.na(optimal_precision_big) && !is.na(optimal_recall_big) && 
+                      (optimal_precision_big + optimal_recall_big) > 0) {
+  2 * (optimal_precision_big * optimal_recall_big) / (optimal_precision_big + optimal_recall_big)
+} else NA
+
+cat("\nBig Fire Model - Performance Metrics (Optimal Threshold):\n")
+cat("Accuracy:", round(optimal_accuracy_big, 3), "\n")
+cat("Precision:", round(optimal_precision_big, 3), "\n")
+cat("Recall:", round(optimal_recall_big, 3), "\n")
+cat("F1 Score:", round(optimal_F1_big, 3), "\n")
+
+roc_obj_big <- roc(global_test_data_big$fire_next_month_big, global_test_data_big$predicted_prob, levels = c("no", "yes"))
+auc_value_big <- auc(roc_obj_big)
+cat("AUC:", round(auc_value_big, 3), "\n")
+
+```
+
+
+**Experimenting with fire cause - found nothing of significance for section 4.1**
+```{r}
+merged_data <- merged_county_fires_weather %>%
+  left_join(
+    california_data %>% select(THE_COUNTY, FIRE_YEAR, STAT_CAUSE_DESCR), 
+    by = c("THE_COUNTY", "YEAR" = "FIRE_YEAR")  
+  ) %>%
+  mutate(
+    STAT_CAUSE_DESCR = ifelse(is.na(STAT_CAUSE_DESCR), "Unknown", STAT_CAUSE_DESCR),  
+    STAT_CAUSE_DESCR = as.factor(STAT_CAUSE_DESCR)
+  )
+
+merged_data <- merged_data %>%
+  group_by(THE_COUNTY) %>%
+  arrange(YEAR, MONTH) %>%
+  mutate(
+    log_acres = log(total_acres_burned + 1),
+    log_next_month_acres = log(next_month_acres + 1),
+    
+    roll_mean_prcp = (total_prcp + lag(total_prcp, 1) + lag(total_prcp, 2)) / 3,
+    roll_mean_tmax = (tmax + lag(tmax, 1) + lag(tmax, 2)) / 3,
+    
+    county_avg_fires = mean(log_acres, na.rm = TRUE),
+    monthly_historical_avg = ave(log_acres, MONTH, FUN = mean),
+    
+    fire_next_month = as.factor(if_else(log_next_month_acres > median(log_next_month_acres, na.rm = TRUE), 
+                                        "yes", "no"))
+  ) %>%
+  ungroup()
+
+split_year <- quantile(unique(merged_data$YEAR), 0.8)
+
+train_data <- merged_data %>% 
+  filter(YEAR <= split_year) %>% 
+  select(fire_next_month, total_prcp, tmax, tmin, THE_COUNTY, STAT_CAUSE_DESCR,
+         roll_mean_prcp, roll_mean_tmax, county_avg_fires, monthly_historical_avg) %>%
+  na.omit()
+
+test_data <- merged_data %>% 
+  filter(YEAR > split_year) %>%
+  select(fire_next_month, total_prcp, tmax, tmin, THE_COUNTY, STAT_CAUSE_DESCR,
+         roll_mean_prcp, roll_mean_tmax, county_avg_fires, monthly_historical_avg) %>%
+  na.omit()
+
+
+# train lr
+model_lr <- glm(fire_next_month ~ ., data = train_data, family = binomial)
+test_data$predicted_prob <- predict(model_lr, test_data, type = "response")
+test_data$predicted <- ifelse(test_data$predicted_prob > 0.5, "yes", "no")
+conf_matrix <- table(Predicted = test_data$predicted, Actual = test_data$fire_next_month)
+
+
+accuracy <- sum(diag(conf_matrix)) / sum(conf_matrix)
+precision <- conf_matrix["yes", "yes"] / sum(conf_matrix["yes", ])
+recall <- conf_matrix["yes", "yes"] / sum(conf_matrix[, "yes"])
+f1_score <- 2 * (precision * recall) / (precision + recall)
+
+# AUC
+roc_obj <- roc(test_data$fire_next_month, test_data$predicted_prob, levels = c("no", "yes"))
+auc_value <- auc(roc_obj)
+
+
+cat("\nConfusion Matrix:\n")
+print(conf_matrix)
+
+cat("\nPerformance Metrics:\n")
+cat("Accuracy:", round(accuracy, 3), "\n")
+cat("Precision:", round(precision, 3), "\n")
+cat("Recall:", round(recall, 3), "\n")
+cat("F1 Score:", round(f1_score, 3), "\n")
+cat("AUC:", round(auc_value, 3), "\n")
+
+# ROC
+plot(roc_obj, col = "red", lwd = 2, main = "ROC Curve for Fire Prediction Model",
+     xlab = "1 - Specificity (False Positive Rate)", ylab = "Sensitivity (True Positive Rate)")
+legend("bottomright", legend = paste("AUC =", round(auc_value, 3)), col = "red", lwd = 2)
+
+
+importance_df <- data.frame(
+  Variable = names(coef(model_lr)),
+  Importance = abs(coef(model_lr))
+) %>%
+  arrange(desc(Importance))
+
+cat("\nFeature Importance:\n")
+print(importance_df)
+
+ggplot(importance_df, aes(x = reorder(Variable, Importance), y = Importance)) +
+  geom_bar(stat = "identity", fill = "#9DB5B2", alpha = 0.8) +
+  coord_flip() +
+  labs(title = "Feature Importance in Logistic Regression Model",
+       x = "Feature", y = "Importance") +
+  theme_minimal()
+
+ggsave("feature_importance_logistic.png", width = 10, height = 6, dpi = 300)
+
+
+```
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(pROC)
+
+merged_data <- merged_county_fires_weather %>%
+  left_join(
+    california_data %>% select(THE_COUNTY, FIRE_YEAR, STAT_CAUSE_DESCR), 
+    by = c("THE_COUNTY", "YEAR" = "FIRE_YEAR")  # Ensure correct join
+  ) %>%
+  mutate(
+    STAT_CAUSE_BINARY = case_when(
+      STAT_CAUSE_DESCR == "Lightning" ~ "Lightning",
+      is.na(STAT_CAUSE_DESCR) ~ "Unknown",
+      TRUE ~ "Human-Caused"  
+    ),
+    STAT_CAUSE_BINARY = as.factor(STAT_CAUSE_BINARY)  
+  )
+
+
+merged_data <- merged_data %>%
+  group_by(THE_COUNTY) %>%
+  arrange(YEAR, MONTH) %>%
+  mutate(
+    log_acres = log(total_acres_burned + 1),
+    log_next_month_acres = log(next_month_acres + 1),
+    
+    roll_mean_prcp = (total_prcp + lag(total_prcp, 1) + lag(total_prcp, 2)) / 3,
+    roll_mean_tmax = (tmax + lag(tmax, 1) + lag(tmax, 2)) / 3,
+    
+    county_avg_fires = mean(log_acres, na.rm = TRUE),
+    monthly_historical_avg = ave(log_acres, MONTH, FUN = mean),
+    
+    fire_next_month = as.factor(if_else(log_next_month_acres > median(log_next_month_acres, na.rm = TRUE), 
+                                        "yes", "no"))
+  ) %>%
+  ungroup()
+
+
+split_year <- quantile(unique(merged_data$YEAR), 0.8)
+
+train_data <- merged_data %>% 
+  filter(YEAR <= split_year) %>% 
+  select(fire_next_month, total_prcp, tmax, tmin, THE_COUNTY, STAT_CAUSE_BINARY,
+         roll_mean_prcp, roll_mean_tmax, county_avg_fires, monthly_historical_avg) %>%
+  na.omit()
+
+test_data <- merged_data %>% 
+  filter(YEAR > split_year) %>%
+  select(fire_next_month, total_prcp, tmax, tmin, THE_COUNTY, STAT_CAUSE_BINARY,
+         roll_mean_prcp, roll_mean_tmax, county_avg_fires, monthly_historical_avg) %>%
+  na.omit()
+
+
+model_lr <- glm(fire_next_month ~ ., data = train_data, family = binomial)
+
+test_data$predicted_prob <- predict(model_lr, test_data, type = "response")
+
+test_data$predicted <- ifelse(test_data$predicted_prob > 0.5, "yes", "no")
+
+conf_matrix <- table(Predicted = test_data$predicted, Actual = test_data$fire_next_month)
+
+accuracy <- sum(diag(conf_matrix)) / sum(conf_matrix)
+precision <- conf_matrix["yes", "yes"] / sum(conf_matrix["yes", ])
+recall <- conf_matrix["yes", "yes"] / sum(conf_matrix[, "yes"])
+f1_score <- 2 * (precision * recall) / (precision + recall)
+
+# AUC
+roc_obj <- roc(test_data$fire_next_month, test_data$predicted_prob, levels = c("no", "yes"))
+auc_value <- auc(roc_obj)
+
+
+cat("\nConfusion Matrix:\n")
+print(conf_matrix)
+
+cat("\nPerformance Metrics:\n")
+cat("Accuracy:", round(accuracy, 3), "\n")
+cat("Precision:", round(precision, 3), "\n")
+cat("Recall:", round(recall, 3), "\n")
+cat("F1 Score:", round(f1_score, 3), "\n")
+cat("AUC:", round(auc_value, 3), "\n")
+
+# ROC
+plot(roc_obj, col = "red", lwd = 2, main = "ROC Curve for Fire Prediction Model",
+     xlab = "1 - Specificity (False Positive Rate)", ylab = "Sensitivity (True Positive Rate)")
+legend("bottomright", legend = paste("AUC =", round(auc_value, 3)), col = "red", lwd = 2)
+
+
+importance_df <- data.frame(
+  Variable = names(coef(model_lr)),
+  Importance = abs(coef(model_lr))
+) %>%
+  arrange(desc(Importance))
+
+cat("\nFeature Importance:\n")
+print(importance_df)
+
+
+ggplot(importance_df, aes(x = reorder(Variable, Importance), y = Importance)) +
+  geom_bar(stat = "identity", fill = "#9DB5B2", alpha = 0.8) +
+  coord_flip() +
+  labs(title = "Feature Importance in Logistic Regression Model",
+       x = "Feature", y = "Importance") +
+  theme_minimal()
+
+ggsave("feature_importance_logistic.png", width = 10, height = 6, dpi = 300)
+
+```
+
+
