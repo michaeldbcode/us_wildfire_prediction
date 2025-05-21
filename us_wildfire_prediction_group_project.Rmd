@@ -38,7 +38,7 @@ library(ncdf4)
 ```{r}
 # what we originally did below
 
-# con <- dbConnect(RSQLite::SQLite(),"~/Library/CloudStorage/OneDrive-LondonSchoolofEconomics/ST309/FPA_FOD_20170508.sqlite")
+# con <- dbConnect(RSQLite::SQLite(),"~/Library/ST309/FPA_FOD_20170508.sqlite")
 # 
 # 
 # fires_data <- dbGetQuery(con, "SELECT * FROM Fires")
