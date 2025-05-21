@@ -1,4 +1,4 @@
-<img width="396" alt="image" src="https://github.com/user-attachments/assets/b234575c-ef1c-40f8-991e-74fe9b4783cb" /># Machine Learning for County-Level Wildfire Risk Prediction in California Through Optimised Classification Models
+# Machine Learning for County-Level Wildfire Risk Prediction in California Through Optimised Classification Models
 
 This repository contains mine and my group's work for our Data Analytics course where we analysed US wildfires, using the FPA dataset (1.88M records of wildfires between 1992-2015) and NASA's Daymet V4 Climate dataset.
 
