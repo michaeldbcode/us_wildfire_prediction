@@ -6,11 +6,11 @@ Please see attached PDF paper for full write-up.
 
 ## Highlighted results:
 
-<img width="479" alt="image" src="https://github.com/user-attachments/assets/3ef4519c-159e-4fda-906a-44eab285b683" />
+<img width="350" alt="image" src="https://github.com/user-attachments/assets/2bba90c3-4f55-4f01-9a9f-ade0e2cc0fa2" />
 
-<img width="396" alt="image" src="https://github.com/user-attachments/assets/64201219-a905-4044-8eb6-c2a1d69cd621" />
+<img width="350" alt="image" src="https://github.com/user-attachments/assets/64201219-a905-4044-8eb6-c2a1d69cd621" />
 
-<img width="650" alt="image" src="https://github.com/user-attachments/assets/3344fb25-b365-47d3-b144-787eb03875b4" />
+<img width="450" alt="image" src="https://github.com/user-attachments/assets/3344fb25-b365-47d3-b144-787eb03875b4" />
 
 
 
