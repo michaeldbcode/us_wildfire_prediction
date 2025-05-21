@@ -10,7 +10,8 @@ Please see attached PDF paper for full write-up.
 
 <img width="396" alt="image" src="https://github.com/user-attachments/assets/64201219-a905-4044-8eb6-c2a1d69cd621" />
 
-<img width="326" alt="image" src="https://github.com/user-attachments/assets/f7d46d95-7b5c-4d0c-a9ff-ee002b37fccc" />
+<img width="650" alt="image" src="https://github.com/user-attachments/assets/3344fb25-b365-47d3-b144-787eb03875b4" />
+
 
 
 ### Report conclusion:
